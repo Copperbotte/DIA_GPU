@@ -63,34 +63,6 @@ cdedir = Path(cdedir)#.mkdir(parents=True, exist_ok=True)
 rawdir = Path(rawdir)#.mkdir(parents=True, exist_ok=True)
 clndir = Path(clndir)#.mkdir(parents=True, exist_ok=True)
 
-if False:
-    file = 'tess2018292095939-s0004-1-4-0124'
-
-
-    def print_header_if_matching(folder, file):
-        files_ = [f for f in folder.glob("*.fits") if isfile(join(folder, f))]
-        ref_, head_ = fits.getdata(os.path.join(folder, files_[0]), header = True)
-        print(f"Header for {folder / files_[0]}:")
-        print(head_.tostring('\n'))
-        print('#'*80)
-        print('#'*80)
-        print('#'*80)
-        globals().update(locals())
-
-
-
-
-    #with fits.open('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/TESS_sector_4/tess2018292095939-s0004-1-4-0124-s_ffic.fits') as hdul:
-    #    print('raw:', hdul[0].header['DQUALITY'])
-
-    print_header_if_matching(rawdir, file)
-    print_header_if_matching(ROOT / "DIA_TEMP" / "clean2", file)
-    print_header_if_matching(ROOT / "DIA_TEMP" / "clean3", file)
-
-
-    raise Exception
-
-
 #sample every how many pixels? usually 32x32 is OK but it can be larger or smaller
 pix = 32 # UPDATE HERE FOR BACKGROUND SPACING
 axs = 2048 # UPDATE HERE FOR IMAGE AXIS SIZE
@@ -155,7 +127,6 @@ if (biassub == 1):
 
 
 from time import time_ns
-import humanize
 # Usage: Create a TimerGroup with a set of keys.
 # Then for each key, we call 'from timer_group with key'. Is that valid syntax?
 # Can I instead do with timer_group['key'] and have it persist state?
@@ -203,8 +174,7 @@ class ProfileTimer:
 
     def get_elapsed_times(self):
         secs = {key: np.array(elapsed) / 1e9 for key, elapsed in self.elapsed_times.items()}  # Convert nanoseconds to seconds
-        return {key: [np.mean(elapsed[0:]), np.std(elapsed[0:]), len(elapsed)] for key, elapsed in secs.items()}  # Return average time for each key
-        #return {key: [np.mean(elapsed[1:]), np.std(elapsed[1:]), len(elapsed)-1] for key, elapsed in secs.items()}  # Return average time for each key
+        return {key: [np.mean(elapsed), np.std(elapsed), len(elapsed)] for key, elapsed in secs.items()}  # Return average time for each key
     
     def __str__(self):
         elapsed_times = self.get_elapsed_times()
@@ -213,7 +183,7 @@ class ProfileTimer:
         params = []
         for key in keys:
             val, std, count = elapsed_times[key]
-            params.append([f'{key}', f'{val:.6f}', f'{std:.6f}', f'{count}', f'{val*count:.6f}', f'{humanize.metric(1/val, "Hz")}'])
+            params.append([f'{key}', f'{val:.6f}', f'{std:.6f}', f'{count}', f'{val*count:.6f}'])
 
         # align by specific directions for readability
         #param_max_lengths = list(map(lambda col: max(len(col)), zip(*params)))
@@ -227,10 +197,8 @@ class ProfileTimer:
             params[n][2] = params[n][2].ljust(param_max_lengths[2])
             params[n][3] = params[n][3].rjust(param_max_lengths[3])
             params[n][4] = params[n][4].rjust(param_max_lengths[4])
-            params[n][5] = params[n][5].rjust(param_max_lengths[5])
 
-        #return '\n'.join(f'{param[0]}: {param[1]} ± {param[2]} seconds for n={param[3]} in {param[4]} seconds' for param in params)
-        return '\n'.join(f'{param[0]}: ({param[5]}) : {param[1]} ± {param[2]} seconds for n={param[3]} in {param[4]} seconds' for param in params)
+        return '\n'.join(f'{param[0]}: {param[1]} ± {param[2]} seconds for n={param[3]} in {param[4]} seconds' for param in params)
         #return '\n'.join(f'{key}: {elapsed[0]:.6f} ± {elapsed[1]:.6f} seconds for n={elapsed[2]} in {elapsed[0]*elapsed[2]:.6f} seconds' for key, elapsed in elapsed_times.items())
 
 #@numba.njit #(parallel=True) # Parallel seems to perform worse.
@@ -1234,14 +1202,19 @@ class CUDASigmaClipBatched:
         n_update = (self.total_n + self.tpb - 1) // self.tpb
         self.grid_update = (n_update, 1)
 
-    def __call__(self, all_data, clip_low=2.5, clip_high=2.5):
+    def __call__(self, all_data, clip_low=2.5, clip_high=2.5, init_mask=None):
         """
         all_data: flat f64 array of shape (n_chunks * chunk_size,)
                   with chunks packed contiguously.
-        Returns: (mask_bool, counts, lows, highs) all arrays of length n_chunks.
+        init_mask: optional int32 array same shape as all_data. If provided,
+                   pixels with mask=0 are excluded from the start (e.g. padding).
+        Returns: (mask_bool, counts, lows, highs, means, stds).
         """
         drv.memcpy_htod(self.g_data, all_data)
-        drv.memcpy_htod(self.g_mask, self.h_mask_ones)
+        if init_mask is not None:
+            drv.memcpy_htod(self.g_mask, init_mask)
+        else:
+            drv.memcpy_htod(self.g_mask, self.h_mask_ones)
 
         cs_i32 = np.int32(self.chunk_size)
         nc_i32 = np.int32(self.n_chunks)
@@ -1287,86 +1260,80 @@ class CUDASigmaClipBatched:
 
         drv.memcpy_dtoh(self.h_mask, self.g_mask)
         mask_bool = self.h_mask.reshape(self.n_chunks, self.chunk_size).astype(bool)
-        return mask_bool, self.h_ccnt.copy(), los, his
+        return mask_bool, self.h_ccnt.copy(), los, his, means, stds
 
 
-
-########################################################################################################################
-########################################################################################################################
-########################################################################################################################
-########################################################################################################################
-########################################################################################################################
-
-# Custom hcongrid evaluation
-
-# def hcongrid(image, header1, header2, preserve_bad_pixels=True, **kwargs):
-#     """
-#     Interpolate an image from one FITS header onto another
-# 
-#     kwargs will be passed to `~scipy.ndimage.interpolation.map_coordinates`
-# 
-#     Parameters
-#     ----------
-#     image : `~numpy.ndarray`
-#         A two-dimensional image
-#     header1 : `~astropy.io.fits.Header` or `~astropy.wcs.WCS`
-#         The header or WCS corresponding to the image
-#     header2 : `~astropy.io.fits.Header` or `~astropy.wcs.WCS`
-#         The header or WCS to interpolate onto
-#     preserve_bad_pixels : bool
-#         Try to set NAN pixels to NAN in the zoomed image.  Otherwise, bad
-#         pixels will be set to zero
-# 
-#     Returns
-#     -------
-#     newimage : `~numpy.ndarray`
-#         ndarray with shape defined by header2's naxis1/naxis2
-# 
-#     Raises
-#     ------
-#     TypeError if either is not a Header or WCS instance
-#     Exception if image1's shape doesn't match header1's naxis1/naxis2
-# 
-#     Examples
-#     --------
-#     >>> fits1 = pyfits.open('test.fits')
-#     >>> target_header = pyfits.getheader('test2.fits')
-#     >>> new_image = hcongrid(fits1[0].data, fits1[0].header, target_header)
-# 
-#     """
-# 
-#     _check_header_matches_image(image, header1)
-# 
-#     grid1 = get_pixel_mapping(header1, header2)
-# 
-#     bad_pixels = np.isnan(image) + np.isinf(image)
-# 
-#     image[bad_pixels] = 0
-# 
-#     newimage = scipy.ndimage.map_coordinates(image, grid1, **kwargs)
-# 
-#     if preserve_bad_pixels:
-#         newbad = scipy.ndimage.map_coordinates(bad_pixels, grid1, order=0,
-#                                                mode='constant',
-#                                                cval=np.nan)
-#         newimage[newbad] = np.nan
-# 
-#     return newimage
+@numba.njit(parallel=True)
+def extract_medians_from_masks(data_flat, mask_flat, n_windows, window_size):
+    """
+    Compute per-window median and std from flat data/mask arrays.
+    data_flat and mask_flat are both 1D, length n_windows * window_size.
+    mask_flat: 1 = valid/surviving, 0 = padding or clipped.
+    Returns (medians, stds) each of length n_windows.
+    """
+    medians = np.empty(n_windows, dtype=np.float64)
+    stds = np.empty(n_windows, dtype=np.float64)
+    for w in numba.prange(n_windows):
+        base = w * window_size
+        # Count survivors
+        cnt = 0
+        for i in range(window_size):
+            if mask_flat[base + i]:
+                cnt += 1
+        if cnt == 0:
+            medians[w] = 0.0
+            stds[w] = 0.0
+            continue
+        # Gather survivors + running sums for std
+        survivors = np.empty(cnt, dtype=np.float64)
+        j = 0
+        s = 0.0
+        s2 = 0.0
+        for i in range(window_size):
+            if mask_flat[base + i]:
+                val = data_flat[base + i]
+                survivors[j] = val
+                s += val
+                s2 += val * val
+                j += 1
+        # Median via sort
+        survivors.sort()
+        if cnt % 2 == 1:
+            medians[w] = survivors[cnt // 2]
+        else:
+            medians[w] = (survivors[cnt // 2 - 1] + survivors[cnt // 2]) / 2.0
+        # Std (population, ddof=0)
+        mean = s / cnt
+        stds[w] = ((s2 / cnt) - mean * mean) ** 0.5
+    return medians, stds
 
 
-
-
-
-
-
-########################################################################################################################
-########################################################################################################################
-########################################################################################################################
-########################################################################################################################
-########################################################################################################################
-
-
-
+def repair_bad_sky_values(x, y, v, s, sig):
+    """
+    Non-destructively repair bad sky sample values.
+    Returns v_clean with bad values replaced by neighbor interpolation.
+    Bad values: v <= 0, or s >= 2*sig.
+    """
+    v_clean = v.copy()
+    # Pass 1: fix where v <= 0
+    bad = np.where(v_clean <= 0)[0]
+    good = np.where(v_clean > 0)[0]
+    if len(bad) > 0 and len(good) > 0:
+        xgood, ygood, vgood = x[good], y[good], v_clean[good]
+        for idx in bad:
+            rd = np.sqrt((xgood - x[idx])**2 + (ygood - y[idx])**2)
+            nearest = np.argsort(rd)[:9]
+            v_clean[idx] = np.median(vgood[nearest])
+    # Pass 2: fix where s >= 2*sig
+    bad = np.where(s >= 2 * sig)[0]
+    good = np.where(s < 2 * sig)[0]
+    if len(bad) > 0 and len(good) > 0:
+        xgood, ygood, vgood = x[good], y[good], v_clean[good]
+        for idx in bad:
+            rd = np.sqrt((xgood - x[idx])**2 + (ygood - y[idx])**2)
+            nearest = np.argsort(rd)[:9]
+            v_clean[idx] = np.median(vgood[nearest])
+    return v_clean
 
 
 def big_cleanup():
@@ -1385,10 +1352,26 @@ def big_cleanup():
     #bck = np.empty(shape=(nboxes,), dtype=float) #get the holder for the image background
     #sbk = np.empty(shape=(nboxes,), dtype=float) #get the holder for the sigma of the image background
 
-    x = np.empty(shape=(int(sze),), dtype=float)
-    y = np.empty(shape=(int(sze),), dtype=float)
-    v = np.empty(shape=(int(sze),), dtype=float)
-    s = np.empty(shape=(int(sze),), dtype=float)
+    # ── Precompute sample coordinates (same for every chunk) ──────────
+    sample_x = np.empty(sze, dtype=float)
+    sample_y = np.empty(sze, dtype=float)
+    _nd = 0
+    for _jj in range(0, bxs + pix, pix):
+        for _kk in range(0, bxs + pix, pix):
+            sample_x[_nd] = min(_jj, bxs - 1)
+            sample_y[_nd] = min(_kk, bxs - 1)
+            _nd += 1
+
+    # ── All-chunk sky value arrays (preserved across phases) ──────────
+    n_big_chunks = naxis * naxis  # 16 for 2048/512
+    v_all = np.empty((n_big_chunks, sze), dtype=float)
+    s_all = np.empty((n_big_chunks, sze), dtype=float)
+
+    # ── Gather buffers for batched local sky sigma clip ────────────────
+    max_window_pixels = (2 * lop) ** 2  # 128² = 16384
+    n_total_windows = n_big_chunks * sze  # 16 × 289 = 4624
+    gather_data = np.empty(n_total_windows * max_window_pixels, dtype=np.float64)
+    gather_init_mask = np.zeros(n_total_windows * max_window_pixels, dtype=np.int32)
 
     xi = np.linspace(0, bxs-1, bxs)
     yi = np.linspace(0, bxs-1, bxs)
@@ -1429,6 +1412,8 @@ def big_cleanup():
     cuda_sigclip_f32 = CUDASigmaClipF32(krnl, max_n=n_chunk)
     n_chunks_total = (axs // bxs) ** 2  # 16 for 2048/512
     cuda_sigclip_batched = CUDASigmaClipBatched(krnl, n_chunks=n_chunks_total, chunk_size=n_chunk)
+    # Batched sigma clip for all local sky windows (4624 windows × 16384 pixels each)
+    cuda_sigclip_local = CUDASigmaClipBatched(krnl, n_chunks=n_total_windows, chunk_size=max_window_pixels)
 
     #begin cleaning
     for ii in range(0, nfiles):
@@ -1539,187 +1524,183 @@ def big_cleanup():
             
             overlap = np.zeros_like(bigimg).astype(int)
 
-            with timers['total_background_subtraction_chunking']:
-                for oo in range(0, axs, bxs): # Chunks of the image in the x direction
-                    for ee in range(0, axs, bxs): # Chunks of the image in the y direction
-                        print(f"{axs = }, {bxs = }, {oo = }, {ee = }")
+            # ── Phase 1: Gather all local sky windows ─────────────────────────
+            # Pack all 4624 overlapping windows (16 chunks × 289 per chunk)
+            # into a flat buffer for batched CUDA sigma clipping.
+            # Each window is up to 128×128 = 16384 pixels; edge windows are
+            # smaller and padded with mask=0.
+            with timers['local_sky_gather']:
+                gather_init_mask[:] = 0  # reset: padding = invalid
+                win_idx = 0
+                for oo in range(0, axs, bxs):
+                    for ee in range(0, axs, bxs):
                         img = bigimg[ee:ee+bxs, oo:oo+bxs]
-                        sig = sbk[oo//bxs, ee//bxs] #get the sigma for this chunk
+                        for jj in range(0, bxs + pix, pix):
+                            for kk in range(0, bxs + pix, pix):
+                                il = max(jj - lop, 0)
+                                ih = min(jj + lop, bxs - 1)
+                                jl = max(kk - lop, 0)
+                                jh = min(kk + lop, bxs - 1)
+                                c = img[jl:jh, il:ih]
+                                overlap[ee+jl:ee+jh, oo+il:oo+ih] += 1
+                                c_flat = c.ravel()
+                                n_pix = len(c_flat)
+                                offset = win_idx * max_window_pixels
+                                gather_data[offset:offset + n_pix] = c_flat
+                                gather_init_mask[offset:offset + n_pix] = 1
+                                win_idx += 1
+                print(f"Gathered {win_idx} local sky windows "
+                      f"({win_idx * max_window_pixels * 8 / 1e6:.1f} MB data)")
 
-                        #create holder arrays for good and bad pixels
-                        # x = np.zeros(shape=(int(sze),), dtype=float)
-                        # y = np.zeros(shape=(int(sze),), dtype=float)
-                        # v = np.zeros(shape=(int(sze),), dtype=float)
-                        # s = np.zeros(shape=(int(sze),), dtype=float)
-                        with timers['preallocating inner']:
-                            x.fill(0.0)
-                            y.fill(0.0)
-                            v.fill(0.0)
-                            s.fill(0.0)
-                        nd = 0
+            # ── Phase 2: Batched CUDA sigma clip ──────────────────────────────
+            # All 4624 windows sigma-clipped in parallel on GPU.
+            # Each window gets its own independent (mean, std, lo, hi).
+            with timers['local_sky_batched_sigmaclip']:
+                clip_masks, clip_counts, clip_los, clip_his, clip_means, clip_stds = \
+                    cuda_sigclip_local(gather_data, clip_low=2.5, clip_high=2.5,
+                                       init_mask=gather_init_mask)
 
-                        # Subdivide the chunks further into smaller boxes for local sky estimation, to capture any local variations in the background. The size of these boxes is determined by the 'lop' variable, which defines the half-size of the box (i.e., the box will be (2*lop) x (2*lop) pixels). We will sample the local sky value at the center of each box, and then use these sampled values to interpolate a smooth background across the entire chunk.
-                        #begin the sampling of the "local" sky value
-                        with timers['local_sky_sampling']:
-                            for jj in range(0, bxs+pix, pix):
-                                for kk in range(0,bxs+pix, pix):
-                                    #print(f"Sampling local sky at pixel ({jj}, {kk}) in chunk ({oo}, {ee})")
-                                    il = np.amax([jj-lop,0])
-                                    ih = np.amin([jj+lop, bxs-1])
-                                    jl = np.amax([kk-lop, 0])
-                                    jh = np.amin([kk+lop, bxs-1])
-                                    c = img[jl:jh, il:ih]
+            if True:  # warm start for the timers in Phase 3 (numba extraction of medians/stds)
+                mask_flat_i32 = clip_masks.ravel().astype(np.int32)
+                all_medians, all_stds = extract_medians_from_masks(
+                    gather_data, mask_flat_i32, n_total_windows, max_window_pixels)
+                v_all[:] = all_medians.reshape(n_big_chunks, sze)
+                s_all[:] = all_stds.reshape(n_big_chunks, sze)
 
-                                    #overlap[ee+jl:ee+jh, oo+il:oo+ih] += 1 #keep track of how many times each pixel is sampled for the local sky estimation, for debugging purposes
-                                    #overlap[ee+jj:ee+jj+lop*2, oo+kk:oo+kk+lop*2] += 1 #keep track of how many times each pixel is sampled for the local sky estimation, for debugging purposes
-                                    # Lets use the bound lower, unbound upper
-                                    overlap[jl:kk+lop, il:jj+lop] += 1 #keep track of how many times each pixel is sampled for the local sky estimation, for debugging purposes
+            # ── Phase 3: Extract per-window median and std ────────────────────
+            # Numba-parallel: sort survivors per widnow, compute median + std.
+            with timers['local_sky_extract']:
+                mask_flat_i32 = clip_masks.ravel().astype(np.int32)
+                all_medians, all_stds = extract_medians_from_masks(
+                    gather_data, mask_flat_i32, n_total_windows, max_window_pixels)
+                v_all[:] = all_medians.reshape(n_big_chunks, sze)
+                s_all[:] = all_stds.reshape(n_big_chunks, sze)
 
-                                    #select the median value with clipping
-                                    cc, cclow, cchigh = scipy.stats.sigmaclip(c, low=2.5, high = 2.5) #sigma clip the background
-                                    lsky = np.median(cc) #the sky background
-                                    ssky = np.std(cc) #sigma of the sky background
-                                    #print(f"Local sky at pixel ({jj}, {kk}) in chunk ({oo}, {ee}): {lsky = }, {ssky = }")
-                                    msg = ""
-                                    msg += f"In chunk ({oo}, {ee}), sampling local sky at pixel ({jj}, {kk})"
-                                    msg += f" In band [{jl}:{jh}, {il}:{ih}]"
-                                    msg += f", got {len(c.flatten())} pixels, {len(cc.flatten())} after sigmaclip"
-                                    msg += f", local sky = {lsky:.2f}, local sigma = {ssky:.2f}" 
-                                    #print(msg)
-                                    x[nd] = np.amin([jj, bxs-1]) #determine the pixel to input
-                                    y[nd] = np.amin([kk, bxs-1]) #determine the pixel to input
-                                    v[nd] = lsky #median sky
-                                    s[nd] = ssky #sigma sky
-                                    nd = nd + 1
-                                    if nd == -1:
-                                        overlap[ee+jl:ee+jh, oo+il:oo+ih] += 1 #keep track of how many times each pixel is sampled for the local sky estimation, for debugging purposes
+            # ╔══════════════════════════════════════════════════════════════╗
+            # ║  CHECKPOINT A — Cross-validate Phase 3 (v_all / s_all)      ║
+            # ║  Re-runs v4's sequential scipy.stats.sigmaclip on every     ║
+            # ║  window and compares with the batched CUDA result.          ║
+            # ║  This isolates: gather packing, CUDA clip, extract_medians. ║
+            # ╚══════════════════════════════════════════════════════════════╝
+            CHECKPOINT_A = True  # flip to False once this layer is cleared
+            if CHECKPOINT_A:
+                print("\n=== CHECKPOINT A: Phase 3 vs scipy.stats.sigmaclip ===")
+                _v_ref_all = np.empty_like(v_all)
+                _s_ref_all = np.empty_like(s_all)
+                _ci_ref = 0
+                for _oo in range(0, axs, bxs):
+                    for _ee in range(0, axs, bxs):
+                        _img = bigimg[_ee:_ee+bxs, _oo:_oo+bxs]
+                        _nd = 0
+                        for _jj in range(0, bxs + pix, pix):
+                            for _kk in range(0, bxs + pix, pix):
+                                _il = max(_jj - lop, 0)
+                                _ih = min(_jj + lop, bxs - 1)
+                                _jl = max(_kk - lop, 0)
+                                _jh = min(_kk + lop, bxs - 1)
+                                _c = _img[_jl:_jh, _il:_ih]
+                                _cc, _, _ = scipy.stats.sigmaclip(_c, low=2.5, high=2.5)
+                                _v_ref_all[_ci_ref, _nd] = np.median(_cc)
+                                _s_ref_all[_ci_ref, _nd] = np.std(_cc)
+                                _nd += 1
+                        _ve = np.abs(v_all[_ci_ref] - _v_ref_all[_ci_ref])
+                        _se = np.abs(s_all[_ci_ref] - _s_ref_all[_ci_ref])
+                        print(f"  ci={_ci_ref:2d} (oo={_oo:4d},ee={_ee:4d}): "
+                              f"|Δv| max={_ve.max():.4e} mean={_ve.mean():.4e}  "
+                              f"|Δs| max={_se.max():.4e} mean={_se.mean():.4e}")
+                        _ci_ref += 1
+                _dv = np.abs(v_all - _v_ref_all)
+                _ds = np.abs(s_all - _s_ref_all)
+                print(f"  OVERALL: |Δv| max={_dv.max():.4e}  |Δs| max={_ds.max():.4e}")
+                # Expose for interactive inspection (imshow, histogram, etc.)
+                chk_a_dv = _dv  # shape (16, 289): per-chunk, per-window median error
+                chk_a_ds = _ds  # shape (16, 289): per-chunk, per-window std error
+                chk_a_v_ref = _v_ref_all  # scipy reference medians
+                chk_a_s_ref = _s_ref_all  # scipy reference stds
+                print("=== END CHECKPOINT A ===\n")
 
-                                        globals().update(locals())
-                                        raise Exception("Debug")
-                        print(f"Sampled {nd} local sky values in chunk ({oo}, {ee})")
-                        # import matplotlib.pyplot as plt
-                        # plt.imshow(overlap, origin='lower')
-                        # plt.show()
-                        # globals().update(locals())
-                        # raise Exception("Debug")
+            # ── Phase 4: Per-chunk repair + RBF fit + evaluate ────────────────
+            CHECKPOINT_B = True  # flip to False once this layer is cleared
+            CHECKPOINT_C = True  # flip to False once this layer is cleared
+            with timers['total_background_subtraction_chunking']:
+                for ci in range(n_big_chunks):
+                    oo = (ci // naxis) * bxs
+                    ee = (ci % naxis) * bxs
+                    print(f"{axs = }, {bxs = }, {oo = }, {ee = }")
+                    sig = sbk[oo//bxs, ee//bxs]
 
-                        #now we want to remove any possible values which have bad sky values
-                        with timers['bad_sky_removal']:
-                            rj = np.where(v <= 0) #stuff to remove
-                            kp = np.where(v > 0) #stuff to keep
+                    # Non-destructive repair: v_all/s_all preserved, v_clean is new
+                    with timers['bad_sky_repair']:
+                        v_clean = repair_bad_sky_values(
+                            sample_x, sample_y, v_all[ci], s_all[ci], sig)
 
-                        with timers['bad_sky_removal_interpolation']:
-                            if (len(rj[0]) > 0):
-                                #keep only the good points
-                                xgood = x[kp]
-                                ygood = y[kp]
-                                vgood = v[kp]
-                                sgood = s[kp]
+                    # ── CHECKPOINT B — compare repaired values ────────────────
+                    # Uses the scipy reference from Checkpoint A as input to the
+                    # same repair function. If Δ_repair ≫ Δ_phase3, repair is
+                    # amplifying small input differences.
+                    if CHECKPOINT_B and CHECKPOINT_A:
+                        _v_clean_ref = repair_bad_sky_values(
+                            sample_x, sample_y,
+                            chk_a_v_ref[ci], chk_a_s_ref[ci], sig)
+                        _repair_dv = np.abs(v_clean - _v_clean_ref)
+                        if _repair_dv.max() > 1e-10:
+                            print(f"  CHECKPOINT B ci={ci:2d}: "
+                                  f"|Δ_repair| max={_repair_dv.max():.4e} "
+                                  f"mean={_repair_dv.mean():.4e}  ← repair amplified!")
 
-                                for jj in range(0, len(rj[0])):
-                                    #select the bad point
-                                    idx = rj[0][jj]
-                                    xbad = x[idx]
-                                    ybad = y[idx]
-                                    #use the distance formula to get the closest points
-                                    #rd = math.sqrt((xgood-ygood)**2.+(ygood-ybad)**2.)
-                                    rd = math.sqrt((xgood-xbad)**2.+(ygood-ybad)**2.)
-                                    #sort the radii
-                                    pp = sorted(range(len(rd)), key = lambda k:rd[k])
-                                    #use the closest 10 points to get a median
-                                    vnear = vgood[pp[0:9]]
-                                    ave = np.median(vnear)
-                                    #insert the good value into the array
-                                    v[idx] = ave
+                    with timers['rbf_creation']:
+                        rbf = scipy_interp.RBFInterpolator(
+                            list(zip(sample_x, sample_y)), v_clean,
+                            kernel='thin_plate_spline', smoothing=0.0, degree=1)
+                        globals().update(locals())
+                    with timers['rbf_interpolation']:
+                        globals().update(locals())
 
-                        with timers['bad_sky_removal_interpolation_bad_sigmas']:
-                            #now we want to remove any possible values which have bad sigmas
-                            rjs = np.where(s >= 2*sig)
-                            rj  = rjs[0]
-                            kps = np.where(s < 2*sig)
-                            kp  = kps[0]
+                    if rbf_timer_warmup:
+                        print("Warming up RBF interpolation timer with a single evaluation...")
+                        reshld = custom_rbf_eval(sample_x, sample_y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
+                        print("Warming up CUDA RBF interpolation...")
+                        reshld_cuda = cuda_rbf(sample_x, sample_y, rbf._coeffs, rbf._shift, rbf._scale)
+                        rbf_timer_warmup = False
 
-                            if (len(rj) > 0):
-                                #keep only the good points
-                                xgood = np.array(x[kp])
-                                ygood = np.array(y[kp])
-                                vgood = np.array(v[kp])
-                                sgood = np.array(s[kp])
+                    with timers['custom_rbf_interpolation']:
+                        reshld = custom_rbf_eval(sample_x, sample_y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
+                        globals().update(locals())
 
-                                for jj in range(0, len(rj)):
-                                    #select the bad point
-                                    idx = int(rj[jj])
-                                    xbad = x[idx]
-                                    ybad = y[idx]
-                                    #print xbad, ybad
-                                    #use the distance formula to get the closest points
-                                    rd = np.sqrt((xgood-xbad)**2.+(ygood-ybad)**2.)
-                                    #sort the radii
-                                    pp = sorted(range(len(rd)), key = lambda k:rd[k])
-                                    #use the closest 10 points to get a median
-                                    vnear = vgood[pp[0:9]]
-                                    ave = np.median(vnear)
-                                    #insert the good value into the array
-                                    v[idx] = ave
+                    with timers['cuda_rbf_f64']:
+                        reshld_cuda_f64 = cuda_rbf(sample_x, sample_y, rbf._coeffs, rbf._shift, rbf._scale)
+                        globals().update(locals())
 
-                        #now we interpolate to the rest of the image with a thin-plate spline    
-                        #xi = np.linspace(0, bxs-1, bxs)
-                        #yi = np.linspace(0, bxs-1, bxs)
-                        #XI, YI = np.meshgrid(xi, yi)
-                        with timers['rbf_creation']:
-                            #rbf = Rbf(x, y, v, function = 'thin-plate', smooth = 0.0)
-                            rbf = scipy_interp.RBFInterpolator(list(zip(x, y)), v, kernel='thin_plate_spline', smoothing=0.0, degree=1)
-                            globals().update(locals())
-                        with timers['rbf_interpolation']:
-                            #reshld_OLD = rbf(XYI).reshape(XI.shape)
-                            globals().update(locals())
+                    with timers['cuda_rbf_f64s']:
+                        reshld_cuda_f64s = cuda_rbf_f64s(sample_x, sample_y, rbf._coeffs, rbf._shift, rbf._scale)
+                        globals().update(locals())
 
-                        # with timers['OLD_rbf_creation']:
-                        #     rbf_OLD = Rbf(x, y, v, function = 'thin-plate', smooth = 0.0)
-                        # with timers['OLD_rbf_interpolation']:
-                        #     reshld_OLD = rbf_OLD(XI, YI)
-                        #     # Unused. Keeping around for profiling comparison to the new RBFInterpolator method.
-                        #     globals().update(locals())
-                        
-                        if rbf_timer_warmup:
-                            # Perform a single evaluation to warm up the JIT compiler and get more accurate timing for subsequent calls
-                            print("Warming up RBF interpolation timer with a single evaluation...")
-                            #reshld_custom = custom_rbf_eval(x, y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
-                            reshld = custom_rbf_eval(x, y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
+                    with timers['cuda_rbf_f32']:
+                        reshld_cuda_f32 = cuda_rbf_f32(sample_x, sample_y, rbf._coeffs, rbf._shift, rbf._scale)
+                        globals().update(locals())
 
-                            # Warm up CUDA driver with a throwaway evaluation
-                            print("Warming up CUDA RBF interpolation...")
-                            reshld_cuda = cuda_rbf(x, y, rbf._coeffs, rbf._shift, rbf._scale)
+                    with timers['residual_image_addition']:
+                        reshld_OLD = reshld.copy() # Fake for performance reasons :)
+                        res_orig[ee:ee+bxs, oo:oo+bxs] = reshld_OLD
+                        res[ee:ee+bxs, oo:oo+bxs] = reshld
+                        res_cuda_f64[ee:ee+bxs, oo:oo+bxs]  = reshld_cuda_f64
+                        res_cuda_f64s[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64s
+                        res_cuda_f32[ee:ee+bxs, oo:oo+bxs]  = reshld_cuda_f32
 
-                            rbf_timer_warmup = False
-                        with timers['custom_rbf_interpolation']:
-                            #reshld_custom = custom_rbf_eval(x, y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
-                            reshld = custom_rbf_eval(x, y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
-                            #error = np.max(np.abs(reshld_custom - reshld))
-                            globals().update(locals())
-
-                        with timers['cuda_rbf_f64']:
-                            reshld_cuda_f64 = cuda_rbf(x, y, rbf._coeffs, rbf._shift, rbf._scale)
-                            globals().update(locals())
-
-                        with timers['cuda_rbf_f64s']:
-                            reshld_cuda_f64s = cuda_rbf_f64s(x, y, rbf._coeffs, rbf._shift, rbf._scale)
-                            globals().update(locals())
-
-                        with timers['cuda_rbf_f32']:
-                            reshld_cuda_f32 = cuda_rbf_f32(x, y, rbf._coeffs, rbf._shift, rbf._scale)
-                            globals().update(locals())
-
-                        with timers['residual_image_addition']:
-                            #now add the values to the residual image
-                            reshld_OLD = reshld.copy() # Fake for performance reasons :)
-                            res_orig[ee:ee+bxs, oo:oo+bxs] = reshld_OLD
-                            res[ee:ee+bxs, oo:oo+bxs] = reshld
-                            res_cuda_f64[ee:ee+bxs, oo:oo+bxs]  = reshld_cuda_f64
-                            res_cuda_f64s[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64s
-                            res_cuda_f32[ee:ee+bxs, oo:oo+bxs]  = reshld_cuda_f32
-                            #tts = tts+1
-                            #return
+                    # ── CHECKPOINT C — compare final background tile ──────────
+                    # Builds a second RBF from the scipy reference v_clean and
+                    # compares the evaluated 512×512 output tile.
+                    if CHECKPOINT_C and CHECKPOINT_A:
+                        _rbf_ref = scipy_interp.RBFInterpolator(
+                            list(zip(sample_x, sample_y)), _v_clean_ref,
+                            kernel='thin_plate_spline', smoothing=0.0, degree=1)
+                        _reshld_ref = custom_rbf_eval(
+                            sample_x, sample_y, XI, YI,
+                            _rbf_ref._coeffs, _rbf_ref._shift, _rbf_ref._scale)
+                        _tile_err = np.abs(reshld - _reshld_ref)
+                        print(f"  CHECKPOINT C ci={ci:2d}: "
+                              f"|Δ_tile| max={_tile_err.max():.4e} "
+                              f"mean={_tile_err.mean():.4e}")
 
 
         
@@ -1736,6 +1717,15 @@ def big_cleanup():
             # uncomment the import at the top and ensure the function is on PATH.
             with timers['hcongrid_alignment']:
                 algn = hcongrid(sub, header, rhead) # Do I even need this? Its mapping nothing.
+
+                #if ii == 0:
+                #    # Frame 0 IS the reference — skip the expensive WCS
+                #    # round-trip that would just map the image onto itself.
+                #    algn = sub
+                #else:
+                #    algn = hcongrid(sub, header, rhead)
+
+                
                 #algn = sub.copy() # Placeholder for alignment step; always a no-op?
 
             with timers['header_update']:
@@ -2005,6 +1995,3 @@ def plots():
     globals().update(locals())
 
 plots()
-
-
-
