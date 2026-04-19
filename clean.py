@@ -29,6 +29,11 @@ from os.path import isfile, join
 
 #import relevant spline libraries
 from scipy.interpolate import Rbf
+import scipy.interpolate as scipy_interp
+
+# Modern tools
+import numpy as np
+import numba
 
 #####UPDATE INFORMATION HERE####
 #DO YOU WANT TO FLAT FIELD AND BIAS SUBTRACT?
@@ -46,22 +51,16 @@ caldir = 'N/A' #directory with the calibration images such as bias & flat
 from pathlib import Path
 ROOT = Path('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/')
 cdedir = ROOT / "DIA" / "routines" / "Python"
-rawdir = ROOT / "DIA_TEMP" / "raw"
-#rawdir = ROOT / "TESS_sector_4"
+#rawdir = ROOT / "DIA_TEMP" / "raw"
+rawdir = ROOT / "TESS_sector_4"
+#clndir = ROOT / "DIA_TEMP" / "clean"
 clndir = ROOT / "DIA_TEMP" / "clean2"
-clndir_control = ROOT / "DIA_TEMP" / "clean"
 
 # ensure the output directories exist
 ROOT = Path(ROOT)#.mkdir(parents=True, exist_ok=True)
 cdedir = Path(cdedir)#.mkdir(parents=True, exist_ok=True)
 rawdir = Path(rawdir)#.mkdir(parents=True, exist_ok=True)
 clndir = Path(clndir)#.mkdir(parents=True, exist_ok=True)
-clndir_control = Path(clndir_control)
-
-ROOT.mkdir(parents=True, exist_ok=True)
-cdedir.mkdir(parents=True, exist_ok=True)
-rawdir.mkdir(parents=True, exist_ok=True)
-clndir.mkdir(parents=True, exist_ok=True)
 
 #sample every how many pixels? usually 32x32 is OK but it can be larger or smaller
 pix = 32 # UPDATE HERE FOR BACKGROUND SPACING
@@ -71,16 +70,32 @@ axs = 2048 # UPDATE HERE FOR IMAGE AXIS SIZE
 #get the image list and the number of files which need reduction
 #os.chdir(rawdir) #changes to the raw image direcotory
 files = [f for f in rawdir.glob("*.fits") if isfile(join(rawdir, f))] #gets the relevant files with the proper extension
-files.sort()
-nfiles = len(files)
-#os.chdir(cdedir) #changes back to the code directory
 
 # Cull files that don't match the specified camera and CCD
 camera, ccd = '1', '4'
+def get_camera_and_ccd(f):
+    # with fits.open(f, memmap=True) as hdul:
+    #     camera = hdul[1].header['CAMERA']
+    #     ccd = hdul[1].header['CCD']
+    # Grab these from the filename instead due to perf loss
+    # tess2018297215939-s0004-1-4-0124-s_ffic.fits
+    filename = f.stem  # gets filename without extension
+    parts = filename.split('-')
+    camera = parts[2]
+    ccd = parts[3]
+    return camera, ccd
+
 def filter_file(f):
-	img_data, img_header = fits.getdata(f, header=True)
-	return (img_header['CAMERA'] == camera) and (img_header['CCD'] == ccd)
+    #img_data, img_header = fits.getdata(f, header=True)
+    #img_header = fits.getheader(f)
+    # Get these from the data's header manually
+    camera_val, ccd_val = get_camera_and_ccd(f)
+    return (camera_val == camera) and (ccd_val == ccd)
 files = list(filter(filter_file, files))
+
+files.sort()
+nfiles = len(files)
+#os.chdir(cdedir) #changes back to the code directory
 
 #get the zeroth image for registration
 #read in the image
@@ -91,241 +106,1185 @@ rhead['NAXIS2'] = 2048
 
 #sample every how many pixels?
 bxs = 512 #how big do you want to make the boxes for each image?
+#bxs = axs # Do nothing #WARNING: O(n^3) 
+#bxs = 1024
+#bxs = 128 # Warning: O(n^3) 
 lop = 2*pix
 sze = int((bxs//pix)*(bxs//pix) + 2*(bxs//pix) + 1) #size holder for later
 
 #read in the flat
 if (flatdiv == 1):
-	flist = fits.open(os.path.join(caldir, 'flat.fits'))
-	fheader = flist[0].header #get the header info
-	flat = flist[0].data #get the image info
+    flist = fits.open(os.path.join(caldir, 'flat.fits'))
+    fheader = flist[0].header #get the header info
+    flat = flist[0].data #get the image info
 
 #read in the bias
 if (biassub == 1):
-	blist = fits.open(os.path.join(caldir, 'bias.fits'))
-	bheader = blist[0].header #get the header info
-	bias = blist[0].data #get the image info
-
-#begin cleaning
-for ii in range(0, nfiles):
-	file_stem = files[ii].stem  # gets filename without extension
-
-	#update the name to be appropriate for what was done to the file
-	if (biassub == 0) and (flatdiv == 0) and (align == 0): 
-		finnme = f'{file_stem}_s.fits'
-	if (biassub == 1) and (flatdiv == 1) and (align == 0):
-		finnme = f'{file_stem}_sfb.fits'
-	if (biassub == 0) and (flatdiv == 0) and (align == 1):
-		finnme = f'{file_stem}_sa.fits'
-	if (biassub == 1) and (flatdiv == 1) and (align == 1):
-		finnme = f'{file_stem}_sfba.fits'
-
-	outpath = clndir / finnme
-	if not clndir.exists():
-		clndir.mkdir(parents=True, exist_ok=True)
-
-	#only create the files that don't exist
-	#if not outpath.exists():
-	if True: # DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG
-		#start the watch
-		st = time.time()
-		sts = time.strftime("%c")
-		print(f'Now cleaning {files[ii]} at {sts}.')
-
-		#read in the image
-		orgimg, header = fits.getdata(files[ii], header = True)
-		w = WCS(header)
-		cut = Cutout2D(orgimg, (1068,1024), (axs, axs), wcs = w)
-		bigimg = cut.data
-
-		#update the header
-		header['CRPIX1'] = 1001.
-		header['NAXIS1'] = 2048
-		header['NAXIS2'] = 2048
-
-		#get the holders ready
-		res = numpy.zeros(shape=(axs, axs), dtype=float) #holder for the background 'image'
-		nboxes = int((axs//bxs)**2)
-		bck = numpy.zeros(shape=(nboxes,), dtype=float) #get the holder for the image backgroudn
-		sbk = numpy.zeros(shape=(nboxes,), dtype=float) #get the holder for the sigma of the image background
-
-		#remove the flat and the bias
-		if (biassub == 1) and (flatdiv == 1):
-			bigimg = bigimg - bias #subtract the bias
-			bigimg = bigimg/flat #subtract the flat
-		
-		tsc_0 = time.time()
-		tts = 0
-		for oo in range(0, axs, bxs):
-			for ee in range(0, axs, bxs):
-				img = bigimg[ee:ee+bxs, oo:oo+bxs] #split the image into small subsections
-				
-				#calculate the sky statistics
-				cimg, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
-				sky = numpy.median(cimg) #determine the sky value
-				sig = numpy.std(cimg) #determine the sigma(sky)
-
-				bck[tts] = sky #insert the image median background
-				sbk[tts] = sig #insert the image sigma background
-				
-		tsc_1 = time.time()
-		print(f'Sigma Clip for {files[ii]} finished in {tsc_1 - tsc_0}s.')
-		
-		tts = 0
-		for oo in range(0, axs, bxs):
-			for ee in range(0, axs, bxs):
-				img = bigimg[ee:ee+bxs, oo:oo+bxs] #split the image into small subsections
-				
-				#create holder arrays for good and bad pixels
-				x = numpy.zeros(shape=(int(sze),), dtype=float)
-				y = numpy.zeros(shape=(int(sze),), dtype=float)
-				v = numpy.zeros(shape=(int(sze),), dtype=float)
-				s = numpy.zeros(shape=(int(sze),), dtype=float)
-				nd = 0
-	
-				#begin the sampling of the "local" sky value
-				for jj in range(0, bxs+pix, pix):
-					for kk in range(0,bxs+pix, pix):
-						il = numpy.amax([jj-lop,0])
-						ih = numpy.amin([jj+lop, bxs-1])
-						jl = numpy.amax([kk-lop, 0])
-						jh = numpy.amin([kk+lop, bxs-1])
-						c = img[jl:jh, il:ih]
-						#select the median value with clipping
-						cc, cclow, cchigh = scipy.stats.sigmaclip(c, low=2.5, high = 2.5) #sigma clip the background
-						lsky = numpy.median(cc) #the sky background
-						ssky = numpy.std(cc) #sigma of the sky background
-						x[nd] = numpy.amin([jj, bxs-1]) #determine the pixel to input
-						y[nd] = numpy.amin([kk, bxs-1]) #determine the pixel to input
-						v[nd] = lsky #median sky
-						s[nd] = ssky #sigma sky
-						nd = nd + 1
-
-				#now we want to remove any possible values which have bad sky values
-				rj = numpy.where(v <= 0) #stuff to remove
-				kp = numpy.where(v > 0) #stuff to keep
-
-				if (len(rj[0]) > 0):
-					#keep only the good points
-					xgood = x[kp]
-					ygood = y[kp]
-					vgood = v[kp]
-					sgood = s[kp]
-
-					for jj in range(0, len(rj[0])):
-						#select the bad point
-						idx = rj[0][jj]
-						xbad = x[idx]
-						ybad = y[idx]
-						#use the distance formula to get the closest points
-						rd = math.sqrt((xgood-ygood)**2.+(ygood-ybad)**2.)
-						#sort the radii
-						pp = sorted(range(len(rd)), key = lambda k:rd[k])
-						#use the closest 10 points to get a median
-						vnear = vgood[pp[0:9]]
-						ave = numpy.median(vnear)
-						#insert the good value into the array
-						v[idx] = ave
-
-				#now we want to remove any possible values which have bad sigmas
-				rjs = numpy.where(s >= 2*sig)
-				rj  = rjs[0]
-				kps = numpy.where(s < 2*sig)
-				kp  = kps[0]
-
-				if (len(rj) > 0):
-					#keep only the good points
-					xgood = numpy.array(x[kp])
-					ygood = numpy.array(y[kp])
-					vgood = numpy.array(v[kp])
-					sgood = numpy.array(s[kp])
-
-					for jj in range(0, len(rj)):
-						#select the bad point
-						idx = int(rj[jj])
-						xbad = x[idx]
-						ybad = y[idx]
-						#print xbad, ybad
-						#use the distance formula to get the closest points
-						rd = numpy.sqrt((xgood-xbad)**2.+(ygood-ybad)**2.)
-						#sort the radii
-						pp = sorted(range(len(rd)), key = lambda k:rd[k])
-						#use the closest 10 points to get a median
-						vnear = vgood[pp[0:9]]
-						ave = numpy.median(vnear)
-						#insert the good value into the array
-						v[idx] = ave
-
-				#now we interpolate to the rest of the image with a thin-plate spline	
-				xi = numpy.linspace(0, bxs-1, bxs)
-				yi = numpy.linspace(0, bxs-1, bxs)
-				XI, YI = numpy.meshgrid(xi, yi)
-				rbf = Rbf(x, y, v, function = 'thin-plate', smooth = 0.0)
-				reshld = rbf(XI, YI)
-			
-				#now add the values to the residual image
-				res[ee:ee+bxs, oo:oo+bxs] = reshld
-				tts = tts+1
-
-		#get the median background
-		mbck = numpy.median(bck)
-		sbck = numpy.median(sbk)
-	
-		#subtract the sky gradient and add back the median background
-		sub = bigimg-res
-		sub = sub + mbck
-
-		#align the image
-		# NOTE: `hcongrid` was originally used for alignment. If available,
-		# uncomment the import at the top and ensure the function is on PATH.
-		algn = hcongrid(sub, header, rhead)
-
-		#update the header
-		header['CTYPE1'] = rhead['CTYPE1']
-		header['CTYPE2'] = rhead['CTYPE2']
-		header['CRVAL1'] = rhead['CRVAL1']
-		header['CRVAL2'] = rhead['CRVAL2']
-		header['CRPIX1'] = rhead['CRPIX1']
-		header['CRPIX2'] = rhead['CRPIX2']
-		header['CD1_1'] = rhead['CD1_1']
-		header['CD1_2'] = rhead['CD1_2']
-		header['CD2_1'] = rhead['CD2_1']
-		header['CD2_2'] = rhead['CD2_2']
-
-		#update the header
-		header['medback'] = mbck
-		header['sigback'] = sbck
-		header['bksub'] = 'yes'
-		if (biassub == 1):
-			header['bias'] = 'yes'
-		if (flatdiv == 1):
-			header['flat'] = 'yes'
-		if (align == 1):
-			header['align'] = 'yes'
-
-		#write out the subtraction
-		shd = fits.PrimaryHDU(algn, header=header)
-		shd.writeto(outpath, overwrite=True)
-
-		#stop the watch
-		fn = time.time()
-		print(f'Background subtraction for {files[ii]} finished in {fn-st}s.')
-		
-		# clndir_control
-		# Find the max abs error between the file we just wrote and the control file.
-		# files = [f for f in rawdir.glob("*.fits") if isfile(join(rawdir, f))]
-		# orgimg, header = fits.getdata(files[ii], header = True)
-		
-		# Load the cleaned image we just wrote
-		cleaned_img, cleaned_header = fits.getdata(outpath, header=True)
-		
-		# Load the control image
-		control_path = clndir_control / finnme
-		control_img, control_header = fits.getdata(control_path, header=True)
-		
-		print(f"Max abs error vs control image: {numpy.max(numpy.abs(cleaned_img - control_img)) = }")
+    blist = fits.open(os.path.join(caldir, 'bias.fits'))
+    bheader = blist[0].header #get the header info
+    bias = blist[0].data #get the image info
 
 
+from time import time_ns
+# Usage: Create a TimerGroup with a set of keys.
+# Then for each key, we call 'from timer_group with key'. Is that valid syntax?
+# Can I instead do with timer_group['key'] and have it persist state?
+class ProfileTimer_Inner:
+    def __init__(self, parent, key):
+        self.parent = parent
+        self.key = key
+
+    def __enter__(self):
+        self.parent.start_times[self.key] = time_ns()
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.parent.start_times[self.key] is not None:
+            self.parent.elapsed_times[self.key].append(time_ns() - self.parent.start_times[self.key])
+            #print(f"Timer for '{self.key}' recorded {self.parent.elapsed_times[self.key] / 1e9:.2f} seconds")
+            self.parent.start_times[self.key] = None
+
+class ProfileTimer:
+    def __init__(self):
+        self.keys = []
+        self.start_times = {}
+        self.elapsed_times = {}
+
+    # If the key isn't present, spawn a new timer
+    def __getitem__(self, key):
+        if key not in self.keys:
+            self.keys.append(key)
+            self.start_times[key] = None
+            self.elapsed_times[key] = []
+            print(f"Created timer for '{key}'")
+        return ProfileTimer_Inner(self, key)
+    
+    # def __enter__(self):
+    #     for key in self.keys:
+    #         self.start_times[key] = time_ns()
+    #     return self
+    # 
+    # def __exit__(self, exc_type, exc_value, traceback):
+    #     for key in self.keys:
+    #         if self.start_times[key] is not None:
+    #             self.elapsed_times[key].append(time_ns() - self.start_times[key])
+    #             #print(f"Timer for '{key}' recorded {self.elapsed_times[key] / 1e9:.2f} seconds")
+    #             self.start_times[key] = None
+
+    def get_elapsed_times(self):
+        np = numpy
+        secs = {key: np.array(elapsed) / 1e9 for key, elapsed in self.elapsed_times.items()}  # Convert nanoseconds to seconds
+        return {key: [np.mean(elapsed), np.std(elapsed), len(elapsed)] for key, elapsed in secs.items()}  # Return average time for each key
+    
+    def __str__(self):
+        elapsed_times = self.get_elapsed_times()
+        # pre-stringify all parameters for better formatting
+        keys = list(elapsed_times.keys())
+        params = []
+        for key in keys:
+            val, std, count = elapsed_times[key]
+            params.append([f'{key}', f'{val:.6f}', f'{std:.6f}', f'{count}', f'{val*count:.6f}'])
+
+        # align by specific directions for readability
+        #param_max_lengths = list(map(lambda col: max(len(col)), zip(*params)))
+        #param_lengths = [list(map(len, col)) for col in zip(*params)]
+        params_T = list(zip(*params))
+        param_lengths_T = [list(map(len, col)) for col in params_T]
+        param_max_lengths = [max(lengths) for lengths in param_lengths_T]
+        for n in range(len(params)):
+            params[n][0] = params[n][0].rjust(param_max_lengths[0])
+            params[n][1] = params[n][1].rjust(param_max_lengths[1])
+            params[n][2] = params[n][2].ljust(param_max_lengths[2])
+            params[n][3] = params[n][3].rjust(param_max_lengths[3])
+            params[n][4] = params[n][4].rjust(param_max_lengths[4])
+
+        return '\n'.join(f'{param[0]}: {param[1]} ± {param[2]} seconds for n={param[3]} in {param[4]} seconds' for param in params)
+        #return '\n'.join(f'{key}: {elapsed[0]:.6f} ± {elapsed[1]:.6f} seconds for n={elapsed[2]} in {elapsed[0]*elapsed[2]:.6f} seconds' for key, elapsed in elapsed_times.items())
+
+#@numba.njit #(parallel=True) # Parallel seems to perform worse.
+#@numba.njit()#parallel=True) # Parallel seems to perform worse.
+def custom_rbf_eval_OLD(x, y, XI, YI, coeffs, shift, scale):
+    # x: 1D array of x-coordinates of the INPUT sampled points (ex. 289)
+    # y: 1D array of y-coordinates of the INPUT sampled points (ex. 289)
+    # v: 1D array of values at the INPUT sampled points (ex. 289)
+    ## rbf.nodes: 1D array of the fit nodes. Replaces v. (ex. 289)
+    # rbf2._coeffs: "2D" array of the fit nodes and linear component. Replaces v. (ex. 289+3 x 1)
+    # XI: 2D array of x-coordinates of the OUTPUT grid (ex. 512x512)
+    # YI: 2D array of y-coordinates of the OUTPUT grid (ex. 512x512)
+    # reshld: 2D array of the OUTPUT grid values (ex. 512x512)
+
+    # with timers['rbf_creation']:
+    #     rbf = Rbf(x, y, v, function = 'thin-plate', smooth = 0.0)
+    # with timers['rbf_interpolation']:
+    #     reshld = rbf(XI, YI)
+    #     globals().update(locals())
+    
+    result = np.zeros(XI.shape, dtype=np.float64)
+    dxy = np.zeros((4, x.shape[0]), dtype=np.float64)
+    for idy in range(XI.shape[0]):
+        for idx in range(XI.shape[1]):
+            dxy[0] = XI[idy, idx] - x
+            dxy[1] = YI[idy, idx] - y
+            # dot product
+            dxy[2] = dxy[0]**2 + dxy[1]**2
+            dxy[3] = np.sqrt(dxy[2])          # r = euclidean distance
+            dxy[3] = dxy[2]*np.log(dxy[3])     # r²·log(r)  (matches scipy exactly)
+            dxy[3][dxy[2] == 0] = 0             # handle the singularity at zero distance
+            #result[idy, idx] += np.sum(dxy[3] * rbf.nodes)
+            #result[idy, idx] += np.sum(dxy[3] * rbf._coeffs[:-3, 0]) # use the fit nodes, not the original values
+            result[idy, idx] += np.sum(dxy[3] * coeffs[:-3, 0]) # use the fit nodes, not the original values
+    #result += rbf._coeffs[-3, 0] + rbf._coeffs[-2, 0]*(XI - rbf._shift[0])/rbf._scale[0] + rbf._coeffs[-1, 0]*(YI - rbf._shift[1])/rbf._scale[1] # add the linear component
+    result += coeffs[-3, 0] + coeffs[-2, 0]*(XI - shift[0])/scale[0] + coeffs[-1, 0]*(YI - shift[1])/scale[1] # add the linear component
+    return result
+
+    #return result, np.max(np.abs(result - reshld))
+    #return np.max(np.abs(result - reshld))
+
+#@numba.njit#(parallel=True)
+def custom_rbf_eval_CPU(x, y, XI, YI, coeffs, shift, scale):
+    """
+    Evaluate a TPS RBF on a regular grid, matching scipy bit-for-bit.
+
+    Uses the same matrix-multiply approach as scipy internally:
+    build the (M, N+3) evaluation matrix, then ``np.dot(vec, coeffs)``.
+    BLAS DGEMV does pairwise/blocked accumulation, eliminating the
+    O(N·eps) summation error of a naive per-pixel loop.
+
+    NOT numba-compilable — the precision comes from BLAS internals.
+    """
+    N = len(x)
+    H, W = XI.shape
+    M = H * W
+
+    # Build (N, 2) observation array and (M, 2) grid array
+    obs = np.empty((N, 2), dtype=np.float64)
+    obs[:, 0] = x
+    obs[:, 1] = y
+
+    grid = np.empty((M, 2), dtype=np.float64)
+    grid[:, 0] = XI.ravel()
+    grid[:, 1] = YI.ravel()
+
+    shift_arr = np.asarray(shift, dtype=np.float64).ravel()
+    scale_arr = np.asarray(scale, dtype=np.float64).ravel()
+    if scale_arr.shape[0] == 1:
+        scale_arr = np.array([scale_arr[0], scale_arr[0]], dtype=np.float64)
+
+    # Normalised eval coords (polynomial part)
+    xhat = np.empty_like(grid)
+    xhat[:, 0] = (grid[:, 0] - shift_arr[0]) / scale_arr[0]
+    xhat[:, 1] = (grid[:, 1] - shift_arr[1]) / scale_arr[1]
+
+    # Process in chunks to bound memory at ~100 MB
+    chunk_sz = max(1, 100_000_000 // (N * 8))
+    out = np.empty(M, dtype=np.float64)
+
+    for i0 in range(0, M, chunk_sz):
+        i1 = min(i0 + chunk_sz, M)
+        g  = grid[i0:i1]                                  # (C, 2)
+        C  = i1 - i0
+
+        # Kernel matrix: r²·log(r) with RAW coordinates
+        diff = g[:, None, :] - obs[None, :, :]             # (C, N, 2)
+        r2   = np.sum(diff ** 2, axis=2)                    # (C, N)
+        K    = np.where(r2 > 0, r2 * np.log(np.sqrt(r2)), 0.0)
+
+        # Evaluation matrix  (C, N+3)  =  [K | 1 | xhat_x | xhat_y]
+        vec = np.empty((C, N + 3), dtype=np.float64)
+        vec[:, :N]   = K
+        vec[:, N]    = 1.0
+        vec[:, N+1]  = xhat[i0:i1, 0]
+        vec[:, N+2]  = xhat[i0:i1, 1]
+
+        # BLAS matrix-vector multiply — same accumulation as scipy
+        out[i0:i1] = np.dot(vec, coeffs).ravel()
+
+    return out.reshape(H, W)
 
 
-print('All done! See ya later alliagtor.')
+@numba.njit
+def custom_rbf_eval_numba(x, y, XI, YI, coeffs, shift, scale):
+    """
+    Numba-compiled TPS RBF evaluator with Kahan compensated summation.
+
+    Same formula as custom_rbf_eval, but expressed as a scalar loop so
+    numba can JIT-compile it.  Kahan summation reduces accumulation
+    error from O(N·eps) to O(eps²), giving ~1e-15 max error.
+    """
+    H = XI.shape[0]
+    W = XI.shape[1]
+    N = x.shape[0]
+    result = np.zeros((H, W), dtype=np.float64)
+
+    # Extract polynomial coefficients (last 3 rows of coeffs)
+    c0 = coeffs[N, 0]      # constant
+    c1 = coeffs[N + 1, 0]  # x coefficient
+    c2 = coeffs[N + 2, 0]  # y coefficient
+    shift_x = shift[0]
+    shift_y = shift[1]
+    scale_x = scale[0]
+    scale_y = scale[-1]     # handles both scalar and 2-element scale
+
+    for idy in range(H):
+        for idx in range(W):
+            u = XI[idy, idx]
+            v = YI[idy, idx]
+
+            # ── Kahan-compensated RBF kernel sum ──
+            s    = 0.0   # running sum
+            comp = 0.0   # compensation for lost low-order bits
+            for k in range(N):
+                dx = u - x[k]
+                dy = v - y[k]
+                r2 = dx * dx + dy * dy
+                if r2 > 0.0:
+                    rbf_val = r2 * np.log(np.sqrt(r2))
+                else:
+                    rbf_val = 0.0
+                term = rbf_val * coeffs[k, 0] - comp
+                t    = s + term
+                comp = (t - s) - term
+                s    = t
+
+            # ── Polynomial (normalised coordinates) ──
+            s += c0 + c1 * (u - shift_x) / scale_x + c2 * (v - shift_y) / scale_y
+
+            result[idy, idx] = s
+
+    return result
+
+def custom_rbf_eval(x, y, XI, YI, coeffs, shift, scale):
+    #return custom_rbf_eval_CPU(x, y, XI, YI, coeffs, shift, scale)
+    return custom_rbf_eval_numba(x, y, XI, YI, coeffs, shift, scale)
+
+import subprocess as sp
+# Prints a line ran through a subprocess how you expect it to work!
+def Call(command, getlines=False, silence=False):
+    pprint = "> %s"%command
+    print(pprint)
+    lines = []
+    with sp.Popen(command,
+        stdout=sp.PIPE, stderr=sp.STDOUT,
+        shell=True, universal_newlines=True # universal newlines makes it not a binary output
+    ) as proc:
+        for line in iter(proc.stdout.readline, ""):
+            if not silence:
+                print(line[:-1])
+            if getlines:
+                lines.append(line[:-1])
+            
+    if getlines:
+        return proc.returncode, lines
+    return proc.returncode
+
+# if Fa lse:
+import os # https://stackoverflow.com/questions/40856535/pycuda-nvcc-fatal-cannot-find-compiler-cl-exe-in-path
+if Call("cl.exe"):#(os.system("cl.exe")):
+    pre, post = r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC", r"bin\Hostx64\x64"
+    os.environ['PATH'] += ';'+os.path.join(pre, sorted(os.listdir(pre))[-1], post)
+if Call("cl.exe"):#(os.system("cl.exe")):
+    raise RuntimeError("cl.exe still not found, path probably incorrect")
+Call(r'"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vsvarsall.bat" x64')
+
+import pycuda.autoinit
+import pycuda.driver as drv
+import pycuda.compiler as nvcc
+
+cu_code = r"""
+// Map 2D thread/block indices to a 1D index, return false if out of bounds
+// Use at the start of a kernel with:
+// int idx;
+// if (mapidx(&idx, width, height)) return;
+// idx is now bounded and has the right index!
+// 
+__device__ bool mapidx(int* idx, int width, int height) {
+    int x = threadIdx.x + blockDim.x * blockIdx.x;
+    int y = threadIdx.y + blockDim.y * blockIdx.y;
+    *idx = y * width + x;
+
+    //bool bounded_below = (0 <= x) && (0 <= y);
+    bool bounded_above = (x < width) && (y < height);
+    //return !(bounded_below && bounded_above);
+
+    // Is bounded below guaranteed?
+    return !bounded_above; 
+}
+#define DEF_IDX(width, height) int idx; if(mapidx(&idx, width, height)) return;
+"""
+
+cu_code += r"""
+
+__constant__ double c_shiftscale[4]; // shift_x, shift_y, scale_x, scale_y
+__constant__ unsigned int c_width_height[2]; // height, width
+__constant__ unsigned int c_npoints; // number of sampled points
+__constant__ double c_linear[3]; // a + bx + cy linear component
+
+// dst:    output grid (reshld), size width*height
+// src_xy: input sample coords, interleaved {x,y}, length 2*npoints
+// src_c:  RBF coefficients for each sample point, length npoints
+//
+// Output grid coordinates are derived from the thread index (integer
+// meshgrid matching linspace(0, bxs-1, bxs)), so no dst_xy buffer is needed.
+__global__
+void rbf_interpolate_cuda_f32(float* dst, float* src_xy, float* src_c) {
+    int col = threadIdx.x + blockDim.x * blockIdx.x;
+    int row = threadIdx.y + blockDim.y * blockIdx.y;
+    if (col >= (int)c_width_height[1] || row >= (int)c_width_height[0]) return;
+    int idx = row * (int)c_width_height[1] + col;
+
+    float u = (float)col;  // XI[row, col] = col
+    float v = (float)row;  // YI[row, col] = row
+
+    // Kahan (compensated) summation: reduces accumulation error
+    // from O(N·eps) to O(eps²).  Cost: 3 extra FP ops per iteration,
+    // fully pipelined — negligible vs the log/sqrt.
+    float result = 0.0f;
+    float comp   = 0.0f;  // running compensation
+    for (unsigned int i = 0; i < c_npoints; i++) {
+        float dx = u - src_xy[i*2 + 0];
+        float dy = v - src_xy[i*2 + 1];
+        float r2 = dx*dx + dy*dy;
+        float rbf_val = (r2 > 0.0f) ? (r2 * logf(sqrtf(r2))) : 0.0f;
+        //result += rbf_val * src_c[i];
+
+        // Kahan summation
+        float term = rbf_val * src_c[i] - comp;
+        float t    = result + term;
+        comp   = (t - result) - term;
+        result = t;
+    }
+    result += (float)c_linear[0]
+            + (float)c_linear[1] * (u - (float)c_shiftscale[0]) / (float)c_shiftscale[2]
+            + (float)c_linear[2] * (v - (float)c_shiftscale[1]) / (float)c_shiftscale[3];
+
+    dst[idx] = result;
+}
+
+// Let's update this one to actually use float32 internally for the for loop.
+// Performance matters a LOT in this case.
+__global__
+void rbf_interpolate_cuda_f64_storage(double* dst, double* src_xy, double* src_c) {
+    int col = threadIdx.x + blockDim.x * blockIdx.x;
+    int row = threadIdx.y + blockDim.y * blockIdx.y;
+    if (col >= (int)c_width_height[1] || row >= (int)c_width_height[0]) return;
+    int idx = row * (int)c_width_height[1] + col;
+
+    float u = (float)col;  // XI[row, col] = col
+    float v = (float)row;  // YI[row, col] = row
+
+    // Mixed-precision Kahan summation: f32 kernel math, f64 accumulation.
+    // The individual rbf_val * coeff products are f32 (~7 digits), but
+    // the Kahan bookkeeping (result, comp, term, t) is f64 so we capture
+    // the low-order bits that f32 addition would lose.  This gives
+    // roughly f64-quality summation from f32-quality terms.
+    double result = 0.0;
+    double comp   = 0.0;
+    for (unsigned int i = 0; i < c_npoints; i++) {
+        float dx = (float)u - (float)src_xy[i*2 + 0];
+        float dy = (float)v - (float)src_xy[i*2 + 1];
+
+        float r2 = dx*dx + dy*dy;
+        float rbf_val = (r2 > 0.0f) ? (r2 * logf(r2)) * 0.5f : 0.0f;
+
+        // Kahan: term and t MUST be double to capture the residual
+        double term = (double)rbf_val * (double)src_c[i] - comp;
+        double t    = result + term;
+        comp   = (t - result) - term;
+        result = t;
+        // This works by tracking the low-order bits lost to rounding in 'comp', and subtracting it from the next term to add, so that it gets included in the sum instead of being lost. The new 'comp' is then the low-order bits lost from adding the term to the result, which will be corrected in the next iteration. This way, we effectively keep a running compensation for lost precision, allowing us to achieve much better accuracy than a naive summation.
+        // Aha! So its kinda like an error diffusion technique, or a kind of dithering?
+        // copilot: Exactly! It's a way to "diffuse" the rounding errors across the entire summation, rather than letting them accumulate in a way that can lead to significant loss of precision. By keeping track of the compensation, we can ensure that the final result is much closer to what we would get with higher precision arithmetic, even though we're using lower precision for the intermediate calculations.
+    }
+    result += c_linear[0]
+            + c_linear[1] * ((double)u - c_shiftscale[0]) / c_shiftscale[2]
+            + c_linear[2] * ((double)v - c_shiftscale[1]) / c_shiftscale[3];
+
+    dst[idx] = result;
+}
+
+__global__
+void rbf_interpolate_cuda_f64(double* dst, double* src_xy, double* src_c) {
+    int col = threadIdx.x + blockDim.x * blockIdx.x;
+    int row = threadIdx.y + blockDim.y * blockIdx.y;
+    if (col >= (int)c_width_height[1] || row >= (int)c_width_height[0]) return;
+    int idx = row * (int)c_width_height[1] + col;
+
+    double u = (double)col;  // XI[row, col] = col
+    double v = (double)row;  // YI[row, col] = row
+
+    // Kahan (compensated) summation: reduces accumulation error
+    // from O(N·eps) to O(eps²).  Cost: 3 extra FP ops per iteration,
+    // fully pipelined — negligible vs the log/sqrt.
+    double result = 0.0;
+    double comp   = 0.0;  // running compensation
+    for (unsigned int i = 0; i < c_npoints; i++) {
+        double dx = u - src_xy[i*2 + 0];
+        double dy = v - src_xy[i*2 + 1];
+
+        double r2 = dx*dx + dy*dy;
+        double rbf_val = (r2 > 0.0) ? (r2 * log(sqrt(r2))) : 0.0;
+        double term = rbf_val * src_c[i] - comp;
+        double t    = result + term;
+        comp   = (t - result) - term;
+        result = t;
+    }
+    result += c_linear[0]
+            + c_linear[1] * (u - c_shiftscale[0]) / c_shiftscale[2]
+            + c_linear[2] * (v - c_shiftscale[1]) / c_shiftscale[3];
+
+    dst[idx] = result;
+}
+
+"""
+# Sanitize
+import re
+def strip_cuda_comments(src: str) -> str:
+    # remove // comments to end of line
+    src = re.sub(r"//.*?$", "", src, flags=re.M)
+    # remove /* … */ block comments (multiline)
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    return src
+cu_code = strip_cuda_comments(cu_code)
+
+krnl = nvcc.SourceModule(cu_code)
+
+class CUDARBFInterpolator:
+    """
+    GPU-accelerated thin-plate spline RBF interpolator.
+
+    Wraps ``scipy.interpolate.RBFInterpolator`` for coefficient fitting (CPU)
+    and a custom CUDA kernel for fast evaluation on a regular output grid.
+
+    The output grid is an integer meshgrid ``(0..width-1, 0..height-1)``;
+    coordinates are derived from the CUDA thread index, eliminating the
+    need for a separate dst_xy buffer.
+
+    All GPU memory is allocated once at construction time so that the
+    per-frame cost is just a few small memcpy's + one kernel launch.
+    """
+
+    def __init__(self, krnl, width, height, max_n_points, mode=None):
+        """
+        Parameters
+        ----------
+        krnl : pycuda.compiler.SourceModule
+            Compiled CUDA module containing ``rbf_interpolate_cuda``.
+        width, height : int
+            Dimensions of the output evaluation grid.
+        max_n_points : int
+            Upper bound on the number of RBF sample points.
+        mode : str, optional
+            Precision mode for the GPU kernel. Options are "f32", "f64_storage", and "f64".
+        """
+        mode = "f64" if mode is None else mode #handle python quirk where this can be changed
+        # -------------------------------------------------------------------
+        self.width  = width
+        self.height = height
+        self.max_n_points = max_n_points
+        self.n_pixels = width * height
+
+        # Float type selection for testing precision tradeoffs. 
+        # The kernel uses float internally, so we need to convert to float32 for the GPU. This is a bit sad, but it seems that using float64 storage with float32 math is more accurate than using float64 math, which is likely due to the fact that the kernel's math is optimized for float32 and may not handle float64 as well. If we used float64 storage with float64 math, we might get even better precision, but it would likely be much slower. So we'll stick with float32 storage and math for the GPU, and just convert to float64 on the CPU side for better precision in the final output.
+        
+        # ---- Kernel handle + dtype config ---------------------------------
+        LUT = {
+            "f32":         (np.float32, krnl.get_function("rbf_interpolate_cuda_f32")),
+            "f64_storage": (np.float64, krnl.get_function("rbf_interpolate_cuda_f64_storage")),
+            # use the f64 storage kernel for better precision, even though it has f32 math internally (Test perf on this)
+            "f64":         (np.float64, krnl.get_function("rbf_interpolate_cuda_f64"))
+        }
+        #self.float_t, self.kernel = LUT["f64_storage"] # UPDATE HERE FOR KERNEL/DTYPE SELECTION
+        self.float_t, self.kernel = LUT[mode]
+
+        # ---- GPU buffer allocations (once) --------------------------------
+        sizeof_float = np.dtype(self.float_t).itemsize
+        self.g_dst    = drv.mem_alloc(self.n_pixels * sizeof_float)       # output
+        self.g_src_xy = drv.mem_alloc(max_n_points * 2 * sizeof_float)   # interleaved {x,y}
+        self.g_src_c  = drv.mem_alloc(max_n_points * sizeof_float)        # coefficients
+
+        # Host-side output buffer (reused every call)
+        self.h_dst = np.empty(self.n_pixels, dtype=self.float_t)
+
+        # ---- Constant memory: grid size (fixed for lifetime) --------------
+        c_wh = np.array([height, width], dtype=np.uint32)
+        ptr, _ = krnl.get_global("c_width_height")
+        drv.memcpy_htod(ptr, c_wh)
+
+        # Cache constant-memory pointers so we don't re-query each frame
+        self._g_shiftscale, _ = krnl.get_global("c_shiftscale")
+        self._g_npoints,    _ = krnl.get_global("c_npoints")
+        self._g_linear,     _ = krnl.get_global("c_linear")
+
+        # ---- Kernel handle + launch config --------------------------------
+        # k32 = krnl.get_function("rbf_interpolate_cuda_f32")
+        # k64s= krnl.get_function("rbf_interpolate_cuda_f64_storage") # use the f64 storage kernel for better precision, even though it has f32 math internally (Test perf on this)
+        # k64 = krnl.get_function("rbf_interpolate_cuda_f64")
+        # self.kernel = {
+        #     np.float32: k32,
+        #     np.float64: k64s
+        # #    np.float64: k64
+        # }[self.float_t]
+        # See above
+        
+        tpa = 16  # threads per axis -> 256 threads / block
+        self._block = (tpa, tpa, 1)
+        self._grid  = (
+            (width  + tpa - 1) // tpa,
+            (height + tpa - 1) // tpa,
+            1,
+        )
+
+        # ---- Cached fit results -------------------------------------------
+        self._coeffs = None
+        self._shift  = None
+        self._scale  = None
+        self._x = None
+        self._y = None
+
+    # ------------------------------------------------------------------
+    def fit(self, x, y, v):
+        """
+        Fit thin-plate-spline RBF on the CPU via scipy.
+
+        Returns the underlying ``scipy.interpolate.RBFInterpolator`` so
+        callers can inspect ``_coeffs``, ``_shift``, ``_scale``, etc.
+        """
+        rbf = scipy_interp.RBFInterpolator(
+            list(zip(x, y)), v,
+            kernel='thin_plate_spline', smoothing=0.0, degree=1,
+        )
+        self._coeffs = rbf._coeffs
+        self._shift  = rbf._shift
+        self._scale  = rbf._scale
+        self._x = np.asarray(x, dtype=self.float_t)
+        self._y = np.asarray(y, dtype=self.float_t)
+        return rbf
+
+    # ------------------------------------------------------------------
+    def evaluate(self, x=None, y=None, coeffs=None, shift=None, scale=None):
+        """
+        Evaluate the fitted RBF on the GPU over the full (width x height)
+        grid.
+
+        Accepts explicit arrays **or** falls back to the results of the
+        last ``fit()`` call.  Returns a ``(height, width)`` float64 array
+        to match the CPU code path.
+        """
+        x      = np.asarray(x      if x      is not None else self._x,      dtype=self.float_t)
+        y      = np.asarray(y      if y      is not None else self._y,      dtype=self.float_t)
+        coeffs = np.asarray(coeffs if coeffs is not None else self._coeffs, dtype=self.float_t)
+        shift  = np.asarray(shift  if shift  is not None else self._shift,  dtype=self.float_t)
+        scale  = np.asarray(scale  if scale  is not None else self._scale,  dtype=self.float_t)
+
+        n = len(x)
+
+        # ---- Upload source-point coordinates (interleaved x, y) ----------
+        #float_t = np.float32 # the kernel uses float internally, so we need to convert to float32 for the GPU. This is a bit sad, but it seems that using float64 storage with float32 math is more accurate than using float64 math, which is likely due to the fact that the kernel's math is optimized for float32 and may not handle float64 as well. If we used float64 storage with float64 math, we might get even better precision, but it would likely be much slower. So we'll stick with float32 storage and math for the GPU, and just convert to float64 on the CPU side for better precision in the final output.
+        h_src_xy = np.empty(n * 2, dtype=self.float_t)
+        h_src_xy[0::2] = x.astype(self.float_t)
+        h_src_xy[1::2] = y.astype(self.float_t)
+        drv.memcpy_htod(self.g_src_xy, h_src_xy)
+
+        # ---- Upload RBF coefficients (everything except the 3 linear terms)
+        h_src_c = coeffs[:-3, 0].astype(self.float_t)
+        drv.memcpy_htod(self.g_src_c, h_src_c)
+
+        # ---- Upload per-evaluation constants -----------------------------
+        # NOTE: c_shiftscale and c_linear are declared as double in CUDA
+        # constant memory (shared by both f32 and f64 kernels), so these
+        # uploads must ALWAYS be float64 regardless of self.float_t.
+        drv.memcpy_htod(
+            self._g_shiftscale,
+            np.array([shift[0], shift[1], scale[0], scale[1]], dtype=np.float64),
+        )
+        drv.memcpy_htod(
+            self._g_npoints,
+            np.array([n], dtype=np.uint32),
+        )
+        drv.memcpy_htod(
+            self._g_linear,
+            np.array([coeffs[-3, 0], coeffs[-2, 0], coeffs[-1, 0]], dtype=np.float64),
+        )
+
+        # ---- Launch kernel -----------------------------------------------
+        self.kernel(
+            self.g_dst, self.g_src_xy, self.g_src_c,
+            block=self._block, grid=self._grid,
+        )
+
+        # ---- Download result ---------------------------------------------
+        drv.memcpy_dtoh(self.h_dst, self.g_dst)
+
+        return self.h_dst.reshape(self.height, self.width).astype(np.float64)
+
+    # ------------------------------------------------------------------
+    def __call__(self, x, y, coeffs, shift, scale):
+        """Drop-in replacement for ``custom_rbf_eval(x, y, XI, YI, coeffs, shift, scale)``."""
+        return self.evaluate(x=x, y=y, coeffs=coeffs, shift=shift, scale=scale)
+
+# If you're claude reading this, hello! Feel free to write an edit here if youd like. :)
+
+# Lets make a function that calls obj.dtype if this function is available. If not, lets call something sensible.
+# For use with a string.
+def dtype(object):
+    if hasattr(object, 'dtype'):
+        return object.dtype
+    else:
+        return type(object)
+
+def big_cleanup():
+    # prevent memory thrashing by preallocating arrays for the background and sigma
+    # Is thrashing the right term here? A better term might be "overhead from repeated allocations" or "performance degradation from dynamic memory management"
+    res = numpy.empty(shape=(axs, axs), dtype=float) #holder for the background 'image'
+    res_orig = numpy.empty_like(res, dtype=float) # separate output buffer for the original RBF, for comparison
+    res_cuda_f64 = np.empty_like(res, dtype=np.float64) # was f32, truncating the f64 output from evaluate()
+    res_cuda_f64s = np.empty_like(res, dtype=np.float64) # separate output buffer for the f64 storage kernel, for comparison
+    res_cuda_f32 = np.empty_like(res, dtype=np.float64) # was f32, truncating the f32 output from evaluate()
+
+    nboxes = int((axs//bxs)**2)
+    bck = numpy.empty(shape=(nboxes,), dtype=float) #get the holder for the image background
+    sbk = numpy.empty(shape=(nboxes,), dtype=float) #get the holder for the sigma of the image background
+
+    x = numpy.empty(shape=(int(sze),), dtype=float)
+    y = numpy.empty(shape=(int(sze),), dtype=float)
+    v = numpy.empty(shape=(int(sze),), dtype=float)
+    s = numpy.empty(shape=(int(sze),), dtype=float)
+
+    xi = numpy.linspace(0, bxs-1, bxs)
+    yi = numpy.linspace(0, bxs-1, bxs)
+    XI, YI = numpy.meshgrid(xi, yi)
+    XYI = numpy.array(list(zip(XI.flatten(), YI.flatten())))
+
+    global_t0 = time.time()
+    timers = ProfileTimer()
+    rbf_timer_warmup = True
+    cuda_rbf = CUDARBFInterpolator(krnl, width=bxs, height=bxs, max_n_points=sze)
+    cuda_rbf_f64s = CUDARBFInterpolator(krnl, width=bxs, height=bxs, max_n_points=sze, mode="f64_storage")
+    cuda_rbf_f32 = CUDARBFInterpolator(krnl, width=bxs, height=bxs, max_n_points=sze, mode="f32")
+
+    #begin cleaning
+    for ii in range(0, nfiles):
+        # DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG
+        #if ii == 2:
+        if ii == 1:
+            break
+        file_stem = files[ii].stem  # gets filename without extension
+
+        #update the name to be appropriate for what was done to the file
+        if (biassub == 0) and (flatdiv == 0) and (align == 0): 
+            finnme = f'{file_stem}_s.fits'
+        if (biassub == 1) and (flatdiv == 1) and (align == 0):
+            finnme = f'{file_stem}_sfb.fits'
+        if (biassub == 0) and (flatdiv == 0) and (align == 1):
+            finnme = f'{file_stem}_sa.fits'
+        if (biassub == 1) and (flatdiv == 1) and (align == 1):
+            finnme = f'{file_stem}_sfba.fits'
+
+        outpath = clndir / finnme
+
+        #only create the files that don't exist
+        #if not outpath.exists():
+        if True:
+            # DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG
+            #start the watch
+            st = time.time()
+            sts = time.strftime("%c")
+            print(f'Now cleaning {files[ii]} at {sts}.')
+
+            #read in the image
+            with timers['loading']:
+                orgimg, header = fits.getdata(files[ii], header = True)
+            with timers['wcs_and_cutout']:
+                w = WCS(header)
+                cut = Cutout2D(orgimg, (1068,1024), (axs, axs), wcs = w)
+                bigimg = cut.data.astype(np.float64)
+
+            #update the header
+            header['CRPIX1'] = 1001.
+            header['NAXIS1'] = 2048
+            header['NAXIS2'] = 2048
+
+            #get the holders ready
+            #res = numpy.zeros(shape=(axs, axs), dtype=float) #holder for the background 'image'
+            #nboxes = int((axs//bxs)**2)
+            #bck = numpy.zeros(shape=(nboxes,), dtype=float) #get the holder for the image backgroudn
+            #sbk = numpy.zeros(shape=(nboxes,), dtype=float) #get the holder for the sigma of the image background
+            with timers['preallocating']:
+                res.fill(0.0)
+                bck.fill(0.0)
+                sbk.fill(0.0)
+
+            with timers['flat_and_bias_subtraction']:
+                #remove the flat and the bias
+                if (biassub == 1) and (flatdiv == 1):
+                    bigimg = bigimg - bias #subtract the bias
+                    bigimg = bigimg/flat #subtract the flat
+
+            with timers['total_background_subtraction_chunking']:
+                tts = 0
+                for oo in range(0, axs, bxs): # Chunks of the image in the x direction
+                    for ee in range(0, axs, bxs): # Chunks of the image in the y direction
+                        print(f"{axs = }, {bxs = }, {oo = }, {ee = }")
+                        with timers['image_chunking']:
+                            img = bigimg[ee:ee+bxs, oo:oo+bxs] #split the image into small subsections
+                            print(f"{dtype(img) = }")
+                        
+                        #calculate the sky statistics
+                        with timers['sky_stats_sigmaclip']:
+                            cimg, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
+                            print(f"{dtype(cimg) = }")
+                        with timers['sky_stats_median']:
+                            sky = numpy.median(cimg) #determine the sky value
+                            print(f"dtype(sky) = ")
+                        with timers['sky_stats_std']:
+                            sig = numpy.std(cimg) #determine the sigma(sky)
+                            print(f"dtype(sig) = {dtype(sig)}")
+
+
+                        with timers['background_storage']:
+                            bck[tts] = sky #insert the image median background
+                            sbk[tts] = sig #insert the image sigma background
+                            print(f"{dtype(bck[tts]) = }, {dtype(sbk[tts]) = }")
+
+                        #create holder arrays for good and bad pixels
+                        # x = numpy.zeros(shape=(int(sze),), dtype=float)
+                        # y = numpy.zeros(shape=(int(sze),), dtype=float)
+                        # v = numpy.zeros(shape=(int(sze),), dtype=float)
+                        # s = numpy.zeros(shape=(int(sze),), dtype=float)
+                        with timers['preallocating inner']:
+                            x.fill(0.0)
+                            y.fill(0.0)
+                            v.fill(0.0)
+                            s.fill(0.0)
+                        nd = 0
+            
+                        #begin the sampling of the "local" sky value
+                        with timers['local_sky_sampling']:
+                            for jj in range(0, bxs+pix, pix):
+                                for kk in range(0,bxs+pix, pix):
+                                    il = numpy.amax([jj-lop,0])
+                                    ih = numpy.amin([jj+lop, bxs-1])
+                                    jl = numpy.amax([kk-lop, 0])
+                                    jh = numpy.amin([kk+lop, bxs-1])
+                                    c = img[jl:jh, il:ih]
+                                    #select the median value with clipping
+                                    cc, cclow, cchigh = scipy.stats.sigmaclip(c, low=2.5, high = 2.5) #sigma clip the background
+                                    lsky = numpy.median(cc) #the sky background
+                                    ssky = numpy.std(cc) #sigma of the sky background
+                                    x[nd] = numpy.amin([jj, bxs-1]) #determine the pixel to input
+                                    y[nd] = numpy.amin([kk, bxs-1]) #determine the pixel to input
+                                    v[nd] = lsky #median sky
+                                    s[nd] = ssky #sigma sky
+                                    nd = nd + 1
+
+                        #now we want to remove any possible values which have bad sky values
+                        with timers['bad_sky_removal']:
+                            rj = numpy.where(v <= 0) #stuff to remove
+                            kp = numpy.where(v > 0) #stuff to keep
+
+                        with timers['bad_sky_removal_interpolation']:
+                            if (len(rj[0]) > 0):
+                                #keep only the good points
+                                xgood = x[kp]
+                                ygood = y[kp]
+                                vgood = v[kp]
+                                sgood = s[kp]
+
+                                for jj in range(0, len(rj[0])):
+                                    #select the bad point
+                                    idx = rj[0][jj]
+                                    xbad = x[idx]
+                                    ybad = y[idx]
+                                    #use the distance formula to get the closest points
+                                    #rd = math.sqrt((xgood-ygood)**2.+(ygood-ybad)**2.)
+                                    rd = math.sqrt((xgood-xbad)**2.+(ygood-ybad)**2.)
+                                    #sort the radii
+                                    pp = sorted(range(len(rd)), key = lambda k:rd[k])
+                                    #use the closest 10 points to get a median
+                                    vnear = vgood[pp[0:9]]
+                                    ave = numpy.median(vnear)
+                                    #insert the good value into the array
+                                    v[idx] = ave
+
+                        with timers['bad_sky_removal_interpolation_bad_sigmas']:
+                            #now we want to remove any possible values which have bad sigmas
+                            rjs = numpy.where(s >= 2*sig)
+                            rj  = rjs[0]
+                            kps = numpy.where(s < 2*sig)
+                            kp  = kps[0]
+
+                            if (len(rj) > 0):
+                                #keep only the good points
+                                xgood = numpy.array(x[kp])
+                                ygood = numpy.array(y[kp])
+                                vgood = numpy.array(v[kp])
+                                sgood = numpy.array(s[kp])
+
+                                for jj in range(0, len(rj)):
+                                    #select the bad point
+                                    idx = int(rj[jj])
+                                    xbad = x[idx]
+                                    ybad = y[idx]
+                                    #print xbad, ybad
+                                    #use the distance formula to get the closest points
+                                    rd = numpy.sqrt((xgood-xbad)**2.+(ygood-ybad)**2.)
+                                    #sort the radii
+                                    pp = sorted(range(len(rd)), key = lambda k:rd[k])
+                                    #use the closest 10 points to get a median
+                                    vnear = vgood[pp[0:9]]
+                                    ave = numpy.median(vnear)
+                                    #insert the good value into the array
+                                    v[idx] = ave
+
+                        #now we interpolate to the rest of the image with a thin-plate spline    
+                        #xi = numpy.linspace(0, bxs-1, bxs)
+                        #yi = numpy.linspace(0, bxs-1, bxs)
+                        #XI, YI = numpy.meshgrid(xi, yi)
+                        with timers['rbf_creation']:
+                            #rbf = Rbf(x, y, v, function = 'thin-plate', smooth = 0.0)
+                            rbf = scipy_interp.RBFInterpolator(list(zip(x, y)), v, kernel='thin_plate_spline', smoothing=0.0, degree=1)
+                            globals().update(locals())
+                        with timers['rbf_interpolation']:
+                            reshld_OLD = rbf(XYI).reshape(XI.shape)
+                            globals().update(locals())
+
+                        # with timers['OLD_rbf_creation']:
+                        #     rbf_OLD = Rbf(x, y, v, function = 'thin-plate', smooth = 0.0)
+                        # with timers['OLD_rbf_interpolation']:
+                        #     reshld_OLD = rbf_OLD(XI, YI)
+                        #     # Unused. Keeping around for profiling comparison to the new RBFInterpolator method.
+                        #     globals().update(locals())
+                        
+                        if rbf_timer_warmup:
+                            # Perform a single evaluation to warm up the JIT compiler and get more accurate timing for subsequent calls
+                            print("Warming up RBF interpolation timer with a single evaluation...")
+                            #reshld_custom = custom_rbf_eval(x, y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
+                            reshld = custom_rbf_eval(x, y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
+
+                            # Warm up CUDA driver with a throwaway evaluation
+                            print("Warming up CUDA RBF interpolation...")
+                            reshld_cuda = cuda_rbf(x, y, rbf._coeffs, rbf._shift, rbf._scale)
+
+                            rbf_timer_warmup = False
+                        with timers['custom_rbf_interpolation']:
+                            #reshld_custom = custom_rbf_eval(x, y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
+                            reshld = custom_rbf_eval(x, y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
+                            print(f"{dtype(reshld) = }")
+                            #error = np.max(np.abs(reshld_custom - reshld))
+                            globals().update(locals())
+
+                        with timers['cuda_rbf_f64']:
+                            reshld_cuda_f64 = cuda_rbf(x, y, rbf._coeffs, rbf._shift, rbf._scale)
+                            print(f"{dtype(reshld_cuda_f64) = }")
+                            globals().update(locals())
+
+                        with timers['cuda_rbf_f64s']:
+                            reshld_cuda_f64s = cuda_rbf_f64s(x, y, rbf._coeffs, rbf._shift, rbf._scale)
+                            print(f"{dtype(reshld_cuda_f64s) = }")
+                            globals().update(locals())
+
+                        with timers['cuda_rbf_f32']:
+                            reshld_cuda_f32 = cuda_rbf_f32(x, y, rbf._coeffs, rbf._shift, rbf._scale)
+                            print(f"{dtype(reshld_cuda_f32) = }")
+                            globals().update(locals())
+
+                        with timers['residual_image_addition']:
+                            #now add the values to the residual image
+                            res_orig[ee:ee+bxs, oo:oo+bxs] = reshld_OLD
+                            res[ee:ee+bxs, oo:oo+bxs] = reshld
+                            res_cuda_f64[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64
+                            res_cuda_f64s[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64s
+                            res_cuda_f32[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f32
+                            tts = tts+1
+                            print(f"{dtype(res_orig) = }, {dtype(res) = }, {dtype(res_cuda_f64) = }, {dtype(res_cuda_f64s) = }, {dtype(res_cuda_f32) = }")
+                            #return
+
+            with timers['median_background_calculation']:
+                #get the median background
+                mbck = numpy.median(bck)
+                sbck = numpy.median(sbk)
+                print(f"{dtype(mbck) = }, {dtype(sbck) = }")
+        
+            with timers['sky_gradient_subtraction']:
+                #subtract the sky gradient and add back the median background
+                #sub = bigimg-res 
+                #sub = bigimg-res_orig # Switch to res from the original. It should be faster to iterate now!
+                #sub = bigimg-res_cuda_f32 # Switch to res from the original. It should be faster to iterate now!
+                sub = bigimg-res_cuda_f64
+                sub = sub + mbck
+                print(f"{dtype(sub) = }")
+
+            #align the image
+            # NOTE: `hcongrid` was originally used for alignment. If available,
+            # uncomment the import at the top and ensure the function is on PATH.
+            with timers['hcongrid_alignment']:
+                algn = hcongrid(sub, header, rhead)
+                print(f"{dtype(algn) = }")
+
+            with timers['header_update']:
+                #update the header
+                header['CTYPE1'] = rhead['CTYPE1']
+                header['CTYPE2'] = rhead['CTYPE2']
+                header['CRVAL1'] = rhead['CRVAL1']
+                header['CRVAL2'] = rhead['CRVAL2']
+                header['CRPIX1'] = rhead['CRPIX1']
+                header['CRPIX2'] = rhead['CRPIX2']
+                header['CD1_1'] = rhead['CD1_1']
+                header['CD1_2'] = rhead['CD1_2']
+                header['CD2_1'] = rhead['CD2_1']
+                header['CD2_2'] = rhead['CD2_2']
+
+                #update the header
+                header['medback'] = mbck
+                header['sigback'] = sbck
+                header['bksub'] = 'yes'
+                if (biassub == 1):
+                    header['bias'] = 'yes'
+                if (flatdiv == 1):
+                    header['flat'] = 'yes'
+                if (align == 1):
+                    header['align'] = 'yes'
+
+            #write out the subtraction
+            with timers['PrimeryHDU_Prep']:
+                shd = fits.PrimaryHDU(algn, header=header)
+            with timers['PrimeryHDU_Write']:
+                shd.writeto(outpath, overwrite=True)
+
+            #stop the watch
+            fn = time.time()
+            print(f'Background subtraction for {files[ii]} finished in {fn-st}s.')
+
+    print('All done! See ya later alliagtor.')
+    global_t1 = time.time()
+    print(f'Total processing time: {global_t1 - global_t0}s')
+
+    # print the timer results
+    print(timers)
+    globals().update(locals())
+
+# Profiler
+import cProfile
+
+with cProfile.Profile() as pr:
+    big_cleanup()
+    
+    import pstats
+    from pstats import SortKey
+    p = pstats.Stats(pr)
+    p.strip_dirs().sort_stats(SortKey.CUMULATIVE).print_stats(20)
+
+import matplotlib.pyplot as plt
+
+"""
+img_10 = np.abs((res - res_orig)/res_orig)
+img_20 = np.abs((res_cuda - res_orig)/res_orig)
+img_21 = np.abs((res_cuda - res)/res)
+
+res_10 = np.abs((reshld - reshld_OLD)/reshld_OLD)
+res_20 = np.abs((reshld_cuda - reshld_OLD)/reshld_OLD)
+res_21 = np.abs((reshld_cuda - reshld)/reshld)
+ 
+def slog(img):
+    result = np.log(img)
+    # Find the value that is the smallest non nan, non inf value in the image
+    mask = np.isfinite(result) 
+    vmin = result[mask].min()
+    result[~mask] = vmin
+    return result
+
+
+print(f"{np.max(res_10) = }, {np.max(img_10) = }")
+print(f"{np.max(res_20) = }, {np.max(img_20) = }")
+print(f"{np.max(res_21) = }, {np.max(img_21) = }")
+#print(f"{np.max(np.abs((reshld_cuda - reshld)/reshld)) = }")
+#print(f"{np.max(np.abs((res_cuda - res)/res)) = }")
+#plt.imshow(np.log(np.abs((res - res_orig)/res_orig)))
+fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+#i0, i1, i2 = res_10, res_20, res_21
+i0, i1, i2 = img_10, img_20, img_21
+ax[0].set_title("Custom RBF vs Original RBF")
+ax[0].imshow(slog(i0))
+ax[1].set_title("CUDA RBF vs Original RBF")
+ax[1].imshow(slog(i1))
+ax[2].set_title("CUDA RBF vs Custom RBF")
+ax[2].imshow(slog(i2))
+"""
+
+
+def slog(img):
+    result = np.log(img)
+    # Find the value that is the smallest non nan, non inf value in the image
+    mask = np.isfinite(result) 
+    vmin = result[mask].min()
+    result[~mask] = vmin
+    return result
+
+
+# ── Benchmark: all modes vs scipy reference (reshld_OLD) ─────────────
+# Per-chunk precision (last chunk)
+print("\n" + "="*72)
+print("  PRECISION BENCHMARK (last chunk, vs scipy RBFInterpolator)")
+print("="*72)
+ref = reshld_OLD  # scipy is the f64 ground truth
+for label, arr in [("numba/CPU  ", reshld),
+                   ("CUDA f64   ", reshld_cuda_f64),
+                   ("CUDA f64s  ", reshld_cuda_f64s),
+                   ("CUDA f32   ", reshld_cuda_f32)]:
+    abs_err = np.max(np.abs(arr - ref))
+    rel_err = np.max(np.abs((arr - ref) / ref))
+    print(f"  {label}  max|abs|={abs_err:.3e}  max|rel|={rel_err:.3e}")
+print("="*72)
+"""
+# Full-image precision
+print("\n" + "="*72)
+print("  FULL-IMAGE PRECISION (vs scipy reference image)")
+print("="*72)
+for label, arr in [("numba/CPU  ", res),
+                   ("CUDA f64   ", res_cuda_f64),
+                   ("CUDA f64s  ", res_cuda_f64s),
+                   ("CUDA f32   ", res_cuda_f32)]:
+    abs_err = np.max(np.abs(arr - res_orig))
+    rel_err = np.max(np.abs((arr - res_orig) / res_orig))
+    print(f"  {label}  max|abs|={abs_err:.3e}  max|rel|={rel_err:.3e}")
+print("="*72)
+
+# Timing summary
+print("\n" + "="*72)
+print("  TIMING (from ProfileTimer)")
+print("="*72)
+for k in ['rbf_interpolation', 'custom_rbf_interpolation',
+          'cuda_rbf_f64', 'cuda_rbf_f64s', 'cuda_rbf_f32']:
+    if k in timers.elapsed_times and timers.elapsed_times[k]:
+        vals = np.array(timers.elapsed_times[k]) / 1e9
+        print(f"  {k:30s}  {np.mean(vals):.4f}s  (n={len(vals)})")
+print("="*72)
+
+# ── Visual comparison ─────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+fig.suptitle("Relative error vs scipy (log scale)", fontsize=14)
+
+pairs = [
+    ("numba/CPU vs scipy",  res,            res_orig),
+    ("CUDA f64 vs scipy",   res_cuda_f64,   res_orig),
+    ("CUDA f64s vs scipy",  res_cuda_f64s,  res_orig),
+    ("CUDA f32 vs scipy",   res_cuda_f32,   res_orig),
+    ("CUDA f64s vs f64",    res_cuda_f64s,  res_cuda_f64),
+    ("CUDA f32 vs f64",     res_cuda_f32,   res_cuda_f64),
+]
+for ax, (title, a, b) in zip(axes.ravel(), pairs):
+    rel = np.abs((a - b) / b)
+    ax.set_title(title)
+    ax.imshow(slog(rel))
+plt.tight_layout()
+plt.show()
+
+"""
+
+########################################################################################################################
+# Let's build a small test to verify that the last saved image matches what's stored in memory in the variable `algn`.
+# This will help us confirm that the final output is consistent with our in-memory data.
+# `outpath` is currently passed to global scope for testing exactly this! So let's reload it first.
+# 
+# with fits.open(outpath) as hdul:
+#     saved_image = hdul[0].data
+# 
+# >>> algn.dtype
+# dtype('float64')
+# >>> saved_image.dtype
+# dtype('>f8')
+# >>> np.max(np.abs(algn - saved_image))
+# 0.0
+# What is this dtype difference? '>f8' is big-endian float64, while 'float64' is typically little-endian on most platforms. The max absolute difference being 0.0 indicates that the pixel values are identical, so the endianness difference is not affecting the actual data values in this case.
+# Let's prepare this for testing with major refactoring to validate what we're doing.
+# 'C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/DIA_TEMP/clean/tess2018292095939-s0004-1-4-0124-s_ffic_sa.fits'
+# That's the control path. I'm unfamiliar with the path api. How do I do it in a way that works with what we did above?
+# We're using a different clndir instead of the one above. Let's redefine it so we can change the one above later.
+
+cldir_ctrl = Path('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/DIA_TEMP/clean')
+control_path = cldir_ctrl / 'tess2018292095939-s0004-1-4-0124-s_ffic_sa.fits'
+
+with fits.open(control_path) as hdul:
+    control_image = hdul[0].data
+    print(f"Control image dtype: {control_image.dtype}")
+    print(hdul[0].header)
+with fits.open(outpath) as hdul:
+    test_image = hdul[0].data
+    print(f"Test image dtype: {test_image.dtype}")
+
+
+
+
+rel_error = np.abs(test_image - control_image)
+# Lets divide rel_error by abs(control_image), but we need to handle where control_image is 0. Lets define that this error is 0 if the absolute difference is, regardless of the value of control image.
+rel_error = np.where(rel_error == 0, rel_error, rel_error / np.abs(control_image))
+print(f"Max abs relative error: {np.max(rel_error):.3e}")
+
+def slog(img):
+    result = np.log(img)
+    # Find the value that is the smallest non nan, non inf value in the image
+    mask = np.isfinite(result) 
+    #vmin = result[mask].min() # ValueError: zero-size array to reduction operation minimum which has no identity
+    vmin = result[mask].min() if np.any(mask) else 0
+    result[~mask] = vmin
+    return result
+
+# Simple log luminance tonemapper. Taken from visualizer.py.
+def tonemap(img):
+    ld = np.log(img)
+    ld_fltr = ld[~np.isnan(ld) & ~np.isinf(ld)]
+    ld_nan = np.nan_to_num(ld, nan=np.nanmax(ld_fltr), neginf=np.nanmin(ld_fltr), posinf=np.nanmax(ld_fltr))
+    histo, bin_edges = np.histogram(ld_nan, bins=4096)
+    bins = (bin_edges[:-1] + bin_edges[1:]) / 2
+    cs_histo = np.cumsum(histo)
+    cdf_histo = cs_histo.astype(np.float64) / cs_histo[-1].astype(np.float64)
+    ld_mapped = np.interp(ld_nan, bins, cdf_histo)
+    return ld_mapped
+
+#fig, ax = plt.subplots(figsize=(8, 6))
+# Lets put them side by side. I suppose we should multiply the figsize's x component by 3?
+
+def plots():
+    fig, ax = plt.subplots(1, 3, figsize=(6*3, 6), sharex=True, sharey=True)
+    fig.patch.set_facecolor('black')  # Set figure background to black
+    for a in ax:
+        a.set_facecolor('black')  # Set axes background to black
+        a.tick_params(colors='white')  # Set tick colors to white
+        a.xaxis.label.set_color('white')  # Set x-axis label color to white
+        a.yaxis.label.set_color('white')  # Set y-axis label color to white
+        a.title.set_color('white')  # Set title color to white
+
+    imgargs = dict(cmap='viridis', origin='lower', interpolation='lanczos')
+
+    ax[1].set_title("Relative error vs control (log scale)")
+    ax[1].imshow(slog(rel_error), **imgargs)
+
+    ax[0].set_title("Control image (tonemapped)")
+    ax[0].imshow(tonemap(control_image), **imgargs)
+
+    ax[2].set_title("Test image (tonemapped)")
+    ax[2].imshow(tonemap(test_image), **imgargs)
+
+    import datetime
+
+    with fits.open(control_path) as hdul:
+        header = hdul[0].header
+        timestamp = header.get('DATE-OBS', 'Unknown')
+        #sector = header.get('SECTOR', 'Unknown') # This field doesn't exist. Let's parse it from the filename instead.
+        camera = header.get('CAMERA', 'Unknown')
+        ccd = header.get('CCD', 'Unknown')
+
+        sector = control_path.stem.split('-')[1][1:]  # Extract sector from filename (remove 's' prefix)
+
+        timestamp = datetime.datetime.fromisoformat(timestamp)
+        timestamp = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        title = f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}"
+        
+        fig.suptitle(title, color='white')
+
+    fig.tight_layout()
+    plt.show()
+    globals().update(locals())
+
+plots()
+
