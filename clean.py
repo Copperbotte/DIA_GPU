@@ -342,6 +342,11 @@ def custom_rbf_eval_numba(x, y, XI, YI, coeffs, shift, scale):
                     rbf_val = r2 * np.log(np.sqrt(r2))
                 else:
                     rbf_val = 0.0
+
+                # ── Non-Kahan variant ──
+                # s += rbf_val * coeffs[k, 0]
+
+                # ── Kahan extra terms ──
                 term = rbf_val * coeffs[k, 0] - comp
                 t    = s + term
                 comp = (t - s) - term
@@ -1456,7 +1461,7 @@ def big_cleanup():
                             cimg_numba_mask_f32 = sc_cimg[sc_mask]
 
 
-                        cimg = cimg1 #Keep the output the control value for now
+                        cimg = cimg0 #Keep the output the control value for now
 
 
                         with timers['sky_stats_median']:
@@ -1609,12 +1614,12 @@ def big_cleanup():
 
                         with timers['residual_image_addition']:
                             #now add the values to the residual image
-                            #res_orig[ee:ee+bxs, oo:oo+bxs] = reshld_OLD
                             reshld_OLD = reshld.copy() # Fake for performance reasons :)
+                            res_orig[ee:ee+bxs, oo:oo+bxs] = reshld_OLD
                             res[ee:ee+bxs, oo:oo+bxs] = reshld
-                            res_cuda_f64[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64
+                            res_cuda_f64[ee:ee+bxs, oo:oo+bxs]  = reshld_cuda_f64
                             res_cuda_f64s[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64s
-                            res_cuda_f32[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f32
+                            res_cuda_f32[ee:ee+bxs, oo:oo+bxs]  = reshld_cuda_f32
                             tts = tts+1
                             #return
 
@@ -1625,8 +1630,8 @@ def big_cleanup():
         
             with timers['sky_gradient_subtraction']:
                 #subtract the sky gradient and add back the median background
-                #sub = bigimg-res 
-                sub = bigimg-res_orig # Switch to res from the original. It should be faster to iterate now!
+                #sub = bigimg-res_orig # Switch to res from the original. It should be faster to iterate now!
+                sub = bigimg-res 
                 #sub = bigimg-res_cuda_f32 # Switch to res from the original. It should be faster to iterate now!
                 sub = sub + mbck
 
@@ -1920,5 +1925,35 @@ def plots():
     plt.show()
     globals().update(locals())
 
-#plots()
+plots()
+
+
+# Visualize one step of sigma clip via sigma masking
+img = bigimg[1732:1959,126:361]
+
+with timers['sky_stats_sigmaclip_manual']:
+    #cimg, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
+    clip_low, clip_high = 2.5, 2.5
+    clow, chigh = None, None
+    cimg = img.copy().ravel()
+    while True:
+        c_std = numpy.std(cimg)
+        c_mean = numpy.mean(cimg)
+        size = len(cimg)
+        clow = c_mean - c_std * clip_low
+        chigh = c_mean + c_std * clip_high
+        cimg = cimg[(cimg >= clow) & (cimg <= chigh)]
+        delta = size - len(cimg)
+        if delta == 0:
+            break
+
+
+
+img = bigimg[1732:1959,126:361]
+std = np.std(img)
+mean = np.mean(img)
+clow = mean - std * 2.5
+chigh = mean + std * 2.5
+
+mask = np.wh
 
