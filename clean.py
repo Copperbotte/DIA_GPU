@@ -342,6 +342,11 @@ def custom_rbf_eval_numba(x, y, XI, YI, coeffs, shift, scale):
                     rbf_val = r2 * np.log(np.sqrt(r2))
                 else:
                     rbf_val = 0.0
+
+                # ── Non-Kahan variant ──
+                # s += rbf_val * coeffs[k, 0]
+
+                # ── Kahan extra terms ──
                 term = rbf_val * coeffs[k, 0] - comp
                 t    = s + term
                 comp = (t - s) - term
@@ -679,6 +684,138 @@ void sigma_clip_update_mask(const double* data, int* mask,
     }
 }
 
+// ─── f32 sigma-clip kernels ─────────────────────────────────────────
+// Same algorithm as f64, but data is float32 → half the memory bandwidth.
+// Reduction accumulates into f64 for accuracy; mask update reads f32.
+__global__
+void sigma_clip_reduce_f32(const float* data, const int* mask,
+                           double* partial_sum, double* partial_sum_sq,
+                           int* partial_count, int N) {
+    extern __shared__ char _smem[];
+    double* s_sum    = (double*)_smem;
+    double* s_sum_sq = s_sum + blockDim.x;
+    int*    s_count  = (int*)(s_sum_sq + blockDim.x);
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    double lsum = 0.0, lsum2 = 0.0;
+    int lcnt = 0;
+    for (int i = gid; i < N; i += stride) {
+        if (mask[i]) {
+            double v = (double)data[i];
+            lsum  += v;
+            lsum2 += v * v;
+            lcnt++;
+        }
+    }
+    s_sum[tid]    = lsum;
+    s_sum_sq[tid] = lsum2;
+    s_count[tid]  = lcnt;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid]    += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+            s_count[tid]  += s_count[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial_sum[blockIdx.x]    = s_sum[0];
+        partial_sum_sq[blockIdx.x] = s_sum_sq[0];
+        partial_count[blockIdx.x]  = s_count[0];
+    }
+}
+
+__global__
+void sigma_clip_update_mask_f32(const float* data, int* mask,
+                                double lo, double hi,
+                                int* d_changed, int N) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= N) return;
+    if (mask[gid]) {
+        double v = (double)data[gid];
+        if (v < lo || v > hi) {
+            mask[gid] = 0;
+            atomicAdd(d_changed, 1);
+        }
+    }
+}
+
+// ─── Batched sigma-clip kernels ─────────────────────────────────────
+// Process n_chunks independent chunks in ONE kernel launch.
+// Each chunk has chunk_size elements; chunk c starts at data[c*chunk_size].
+// Reduction: each block handles ONE chunk (blockIdx.x = chunk index,
+//            threads grid-stride within that chunk).
+// We launch n_chunks blocks × tpb threads.
+__global__
+void sigma_clip_reduce_batched(const double* data, const int* mask,
+                               double* chunk_sum, double* chunk_sum_sq,
+                               int* chunk_count,
+                               int chunk_size, int n_chunks) {
+    extern __shared__ char _smem[];
+    double* s_sum    = (double*)_smem;
+    double* s_sum_sq = s_sum + blockDim.x;
+    int*    s_count  = (int*)(s_sum_sq + blockDim.x);
+
+    int chunk = blockIdx.x;  // one block per chunk
+    if (chunk >= n_chunks) return;
+    int tid = threadIdx.x;
+    int base = chunk * chunk_size;
+
+    double lsum = 0.0, lsum2 = 0.0;
+    int lcnt = 0;
+    for (int i = tid; i < chunk_size; i += blockDim.x) {
+        int gi = base + i;
+        if (mask[gi]) {
+            double v = data[gi];
+            lsum  += v;
+            lsum2 += v * v;
+            lcnt++;
+        }
+    }
+    s_sum[tid]    = lsum;
+    s_sum_sq[tid] = lsum2;
+    s_count[tid]  = lcnt;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid]    += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+            s_count[tid]  += s_count[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        chunk_sum[chunk]    = s_sum[0];
+        chunk_sum_sq[chunk] = s_sum_sq[0];
+        chunk_count[chunk]  = s_count[0];
+    }
+}
+
+// Mask update for batched: each chunk has its own [lo, hi] bounds.
+// bounds[chunk*2] = lo, bounds[chunk*2+1] = hi.
+// d_changed[chunk] is atomically incremented per chunk.
+__global__
+void sigma_clip_update_mask_batched(const double* data, int* mask,
+                                    const double* bounds, int* d_changed,
+                                    int chunk_size, int total_N) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total_N) return;
+    if (mask[gid]) {
+        int chunk = gid / chunk_size;
+        double lo = bounds[chunk * 2];
+        double hi = bounds[chunk * 2 + 1];
+        double v = data[gid];
+        if (v < lo || v > hi) {
+            mask[gid] = 0;
+            atomicAdd(&d_changed[chunk], 1);
+        }
+    }
+}
+
 """
 # Sanitize
 import re
@@ -953,6 +1090,175 @@ class CUDASigmaClip:
         drv.memcpy_dtoh(self.h_mask[:n], self.g_mask)
         return self.h_mask[:n].astype(bool), total_cnt, lo, hi
 
+
+class CUDASigmaClipF32(CUDASigmaClip):
+    """
+    f32 variant: data uploaded as float32 (half bandwidth), but
+    reduction uses f64 accumulators internally for accuracy.
+    """
+
+    def __init__(self, krnl, max_n):
+        # Reuse base class structure, override kernels + data buffer
+        super().__init__(krnl, max_n)
+        self.reduce_fn = krnl.get_function("sigma_clip_reduce_f32")
+        self.update_fn = krnl.get_function("sigma_clip_update_mask_f32")
+        # Reallocate data buffer as float32 (half the size)
+        drv.DeviceAllocation.free(self.g_data)
+        self.g_data = drv.mem_alloc(max_n * 4)  # float32
+
+    def __call__(self, data, clip_low=2.5, clip_high=2.5):
+        # Convert to f32 for upload, rest of iteration is identical
+        data_f32 = data.astype(np.float32)
+        n = len(data_f32)
+        nbr = self.n_blocks_reduce
+        nbu = (n + self.tpb - 1) // self.tpb
+
+        drv.memcpy_htod(self.g_data, data_f32)
+        drv.memcpy_htod(self.g_mask, self.h_mask_ones)
+
+        block = (self.tpb, 1, 1)
+        grid_r = (nbr, 1)
+        grid_u = (nbu, 1)
+        n_i32 = np.int32(n)
+
+        while True:
+            self.reduce_fn(
+                self.g_data, self.g_mask,
+                self.g_psum, self.g_psum_sq, self.g_pcnt,
+                n_i32,
+                block=block, grid=grid_r, shared=self.smem,
+            )
+            drv.memcpy_dtoh(self.h_psum, self.g_psum)
+            drv.memcpy_dtoh(self.h_psum_sq, self.g_psum_sq)
+            drv.memcpy_dtoh(self.h_pcnt, self.g_pcnt)
+
+            total_sum = self.h_psum.sum()
+            total_sq  = self.h_psum_sq.sum()
+            total_cnt = int(self.h_pcnt.sum())
+            mean = total_sum / total_cnt
+            std  = (total_sq / total_cnt - mean * mean) ** 0.5
+            lo = mean - std * clip_low
+            hi = mean + std * clip_high
+
+            self.h_changed[0] = 0
+            drv.memcpy_htod(self.g_changed, self.h_changed)
+            self.update_fn(
+                self.g_data, self.g_mask,
+                np.float64(lo), np.float64(hi),
+                self.g_changed, n_i32,
+                block=block, grid=grid_u,
+            )
+            drv.memcpy_dtoh(self.h_changed, self.g_changed)
+            if self.h_changed[0] == 0:
+                break
+
+        drv.memcpy_dtoh(self.h_mask[:n], self.g_mask)
+        return self.h_mask[:n].astype(bool), total_cnt, lo, hi
+
+
+class CUDASigmaClipBatched:
+    """
+    Process ALL chunks in ONE kernel launch per iteration.
+
+    Instead of 16 sequential CUDASigmaClip calls (= 16 × ~48 launches = 768
+    kernel launches), this does 1 reduction + 1 mask-update per iteration
+    across ALL 16 chunks simultaneously.
+
+    Reduction: one block per chunk (blockIdx.x = chunk index).
+    Mask update: one grid over all 16 × 262144 = 4.2M pixels.
+    """
+
+    def __init__(self, krnl, n_chunks, chunk_size):
+        self.n_chunks = n_chunks
+        self.chunk_size = chunk_size
+        self.total_n = n_chunks * chunk_size
+        self.reduce_fn = krnl.get_function("sigma_clip_reduce_batched")
+        self.update_fn = krnl.get_function("sigma_clip_update_mask_batched")
+        self.tpb = 256
+
+        # Device buffers
+        self.g_data    = drv.mem_alloc(self.total_n * 8)         # f64 all chunks
+        self.g_mask    = drv.mem_alloc(self.total_n * 4)         # int32 all chunks
+        self.g_csum    = drv.mem_alloc(n_chunks * 8)             # per-chunk sum
+        self.g_csq     = drv.mem_alloc(n_chunks * 8)             # per-chunk sum²
+        self.g_ccnt    = drv.mem_alloc(n_chunks * 4)             # per-chunk count
+        self.g_bounds  = drv.mem_alloc(n_chunks * 2 * 8)         # per-chunk [lo, hi]
+        self.g_changed = drv.mem_alloc(n_chunks * 4)             # per-chunk changed
+
+        # Host buffers
+        self.h_csum    = np.empty(n_chunks, dtype=np.float64)
+        self.h_csq     = np.empty(n_chunks, dtype=np.float64)
+        self.h_ccnt    = np.empty(n_chunks, dtype=np.int32)
+        self.h_bounds  = np.empty(n_chunks * 2, dtype=np.float64)
+        self.h_changed = np.zeros(n_chunks, dtype=np.int32)
+        self.h_mask    = np.empty(self.total_n, dtype=np.int32)
+        self.h_mask_ones = np.ones(self.total_n, dtype=np.int32)
+
+        # Shared memory per block for reduction
+        self.smem = self.tpb * 8 * 2 + self.tpb * 4
+
+        # Grid configs
+        self.block = (self.tpb, 1, 1)
+        self.grid_reduce = (n_chunks, 1)       # one block per chunk
+        n_update = (self.total_n + self.tpb - 1) // self.tpb
+        self.grid_update = (n_update, 1)
+
+    def __call__(self, all_data, clip_low=2.5, clip_high=2.5):
+        """
+        all_data: flat f64 array of shape (n_chunks * chunk_size,)
+                  with chunks packed contiguously.
+        Returns: (mask_bool, counts, lows, highs) all arrays of length n_chunks.
+        """
+        drv.memcpy_htod(self.g_data, all_data)
+        drv.memcpy_htod(self.g_mask, self.h_mask_ones)
+
+        cs_i32 = np.int32(self.chunk_size)
+        nc_i32 = np.int32(self.n_chunks)
+        tn_i32 = np.int32(self.total_n)
+
+        while True:
+            # Reduction: one block per chunk
+            self.reduce_fn(
+                self.g_data, self.g_mask,
+                self.g_csum, self.g_csq, self.g_ccnt,
+                cs_i32, nc_i32,
+                block=self.block, grid=self.grid_reduce, shared=self.smem,
+            )
+            drv.memcpy_dtoh(self.h_csum, self.g_csum)
+            drv.memcpy_dtoh(self.h_csq, self.g_csq)
+            drv.memcpy_dtoh(self.h_ccnt, self.g_ccnt)
+
+            # Compute per-chunk bounds on CPU
+            counts = self.h_ccnt.astype(np.float64)
+            means = self.h_csum / counts
+            stds = np.sqrt(self.h_csq / counts - means * means)
+            los = means - stds * clip_low
+            his = means + stds * clip_high
+            self.h_bounds[0::2] = los
+            self.h_bounds[1::2] = his
+            drv.memcpy_htod(self.g_bounds, self.h_bounds)
+
+            # Reset changed counters
+            self.h_changed[:] = 0
+            drv.memcpy_htod(self.g_changed, self.h_changed)
+
+            # Mask update: one grid over all pixels
+            self.update_fn(
+                self.g_data, self.g_mask,
+                self.g_bounds, self.g_changed,
+                cs_i32, tn_i32,
+                block=self.block, grid=self.grid_update,
+            )
+            drv.memcpy_dtoh(self.h_changed, self.g_changed)
+
+            if self.h_changed.sum() == 0:
+                break
+
+        drv.memcpy_dtoh(self.h_mask, self.g_mask)
+        mask_bool = self.h_mask.reshape(self.n_chunks, self.chunk_size).astype(bool)
+        return mask_bool, self.h_ccnt.copy(), los, his
+
+
 def big_cleanup():
     # prevent memory thrashing by preallocating arrays for the background and sigma
     # Is thrashing the right term here? A better term might be "overhead from repeated allocations" or "performance degradation from dynamic memory management"
@@ -980,6 +1286,7 @@ def big_cleanup():
     n_chunk = bxs * bxs
     # -- nosort cached --
     sc_cimg    = np.empty(n_chunk, dtype=float)
+    sc_cimg_f32 = np.empty(n_chunk, dtype=np.float32)  # for the f32 sigma clip variant
     sc_cimg_sq = np.empty(n_chunk, dtype=float)   # x² for variance via E[x²]-E[x]²
     sc_mask    = np.empty(n_chunk, dtype=bool)
     # -- argsort cached --
@@ -1006,6 +1313,9 @@ def big_cleanup():
     cuda_rbf_f64s = CUDARBFInterpolator(krnl, width=bxs, height=bxs, max_n_points=sze, mode="f64_storage")
     cuda_rbf_f32 = CUDARBFInterpolator(krnl, width=bxs, height=bxs, max_n_points=sze, mode="f32")
     cuda_sigclip = CUDASigmaClip(krnl, max_n=n_chunk)
+    cuda_sigclip_f32 = CUDASigmaClipF32(krnl, max_n=n_chunk)
+    n_chunks_total = (axs // bxs) ** 2  # 16 for 2048/512
+    cuda_sigclip_batched = CUDASigmaClipBatched(krnl, n_chunks=n_chunks_total, chunk_size=n_chunk)
 
     #begin cleaning
     for ii in range(0, nfiles):
@@ -1066,6 +1376,33 @@ def big_cleanup():
                     bigimg = bigimg/flat #subtract the flat
 
             with timers['total_background_subtraction_chunking']:
+                # ── Warmup batched CUDA sigma clip (first launch overhead) ──
+                _warmup_data = np.random.randn(n_chunks_total * n_chunk).astype(np.float64)
+                cuda_sigclip_batched(_warmup_data, 2.5, 2.5)
+                del _warmup_data
+
+                # ── Batched CUDA sigma clip: process ALL chunks with 1 GPU call ──
+                with timers['sky_stats_sigma_clip_cuda_batched']:
+                    with timers['sky_stats_sigma_clip_cuda_batched___gather']:
+                        # Pack all chunks into one contiguous array
+                        batched_data = np.empty(n_chunks_total * n_chunk, dtype=np.float64)
+                        idx_b = 0
+                        for oo_b in range(0, axs, bxs):
+                            for ee_b in range(0, axs, bxs):
+                                chunk = bigimg[ee_b:ee_b+bxs, oo_b:oo_b+bxs].ravel()
+                                batched_data[idx_b*n_chunk:(idx_b+1)*n_chunk] = chunk
+                                idx_b += 1
+                    with timers['sky_stats_sigma_clip_cuda_batched___kernel']:
+                        batched_masks, batched_cnts, batched_los, batched_his = cuda_sigclip_batched(batched_data, 2.5, 2.5)
+                    with timers['sky_stats_sigma_clip_cuda_batched___verify']:
+                        # Verify against scipy for chunk 0
+                        cimg_b0 = batched_data[:n_chunk][batched_masks[0]]
+                        cimg0_ref, _, _ = scipy.stats.sigmaclip(bigimg[0:bxs, 0:bxs], low=2.5, high=2.5)
+                        report = f"Batched CUDA: chunk 0 has {len(cimg_b0)} pixels (ref {len(cimg0_ref)})"
+                        if len(cimg_b0) == len(cimg0_ref):
+                            report += f", max error = {np.abs(cimg_b0 - cimg0_ref).max()}"
+                        print(report)
+
                 tts = 0
                 for oo in range(0, axs, bxs): # Chunks of the image in the x direction
                     for ee in range(0, axs, bxs): # Chunks of the image in the y direction
@@ -1347,9 +1684,11 @@ def big_cleanup():
                             sc_cimg[:] = img.ravel()
                             count_nb, lo_nb, hi_nb = sigma_clip_numba(sc_cimg, 2.5, 2.5)
                             count_nbm, lo_nbm, hi_nbm = sigma_clip_mask_numba(sc_cimg, sc_mask, 2.5, 2.5)
+                            count_nbm, lo_nbm, hi_nbm = sigma_clip_mask_numba(sc_cimg.astype(np.float32), sc_mask, 2.5, 2.5)
                             # Warm up CUDA sigma clip (first launch has extra driver overhead)
                             sc_cimg[:] = img.ravel()
                             _mask_cu, _cnt_cu, _lo_cu, _hi_cu = cuda_sigclip(sc_cimg, 2.5, 2.5)
+                            _mask_cu32, _cnt_cu32, _lo_cu32, _hi_cu32 = cuda_sigclip_f32(sc_cimg, 2.5, 2.5)
 
 
                         with timers['sky_stats_sigma_clip_numba']:
@@ -1371,6 +1710,12 @@ def big_cleanup():
                         if len(cimg0) == len(cimg_numba_mask):
                             report += f"{np.abs(cimg_numba_mask - cimg0).max() = }"
                         print(report)
+
+                        with timers['sky_stats_sigma_clip_mask_numba_f32']:
+                            with timers['sky_stats_sigma_clip_mask_numba_f32___cast']:
+                                sc_cimg_f32[:] = img.ravel().astype(np.float32)
+                            count_nbm_f32, lo_nbm_f32, hi_nbm_f32 = sigma_clip_mask_numba(sc_cimg_f32, sc_mask, 2.5, 2.5)
+                            cimg_numba_mask_f32 = sc_cimg[sc_mask]
 
                         with timers['sky_stats_astropy_sigma_clip']:
                             cimg_astropy_result = astropy_sigma_clip(
@@ -1396,6 +1741,21 @@ def big_cleanup():
                         report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_cuda) = } "
                         if len(cimg0) == len(cimg_cuda):
                             report += f"{np.abs(cimg_cuda - cimg0).max() = }"
+                        print(report)
+
+                        with timers['sky_stats_sigma_clip_cuda_f32']:
+                            with timers['sky_stats_sigma_clip_cuda_f32___upload']:
+                                sc_cimg[:] = img.ravel()
+                            with timers['sky_stats_sigma_clip_cuda_f32___kernel_loop']:
+                                cuda_mask_f32, cuda_cnt_f32, cuda_lo_f32, cuda_hi_f32 = cuda_sigclip_f32(sc_cimg, 2.5, 2.5)
+                            with timers['sky_stats_sigma_clip_cuda_f32___extract']:
+                                cimg_cuda_f32 = sc_cimg[cuda_mask_f32]
+
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_cuda_f32) = } "
+                        if len(cimg0) == len(cimg_cuda_f32):
+                            report += f"{np.abs(cimg_cuda_f32 - cimg0).max() = }"
+                        else:
+                            report += f"DIFF count: {len(cimg_cuda_f32)} vs {len(cimg0)} (delta={len(cimg_cuda_f32)-len(cimg0)})"
                         print(report)
 
 
@@ -1576,8 +1936,8 @@ def big_cleanup():
 
                         with timers['residual_image_addition']:
                             #now add the values to the residual image
-                            #res_orig[ee:ee+bxs, oo:oo+bxs] = reshld_OLD
                             reshld_OLD = reshld.copy() # Fake for performance reasons :)
+                            res_orig[ee:ee+bxs, oo:oo+bxs] = reshld_OLD
                             res[ee:ee+bxs, oo:oo+bxs] = reshld
                             res_cuda_f64[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64
                             res_cuda_f64s[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64s
@@ -1844,44 +2204,22 @@ def plots():
     ax[2].set_title("Test image (tonemapped)")
     ax[2].imshow(tonemap(test_image), **imgargs)
 
-    # Let's add a global descriptor for the Sector, Camera, CCD, and timestamp from the filename. This will help us confirm that we're looking at the correct image and provide context for the comparison.
-    import re
-    filename_pattern = r'tess(\d{13})-s(\d{4})-c(\d)-ccd(\d)-\d{4}-s_ffic_sa\.fits'
-    match = re.match(filename_pattern, control_path.name)
-    if match:
-        timestamp, sector, camera, ccd = match.groups()
-        fig.suptitle(f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}", color='white')
-    # Lets check this from the file directly.
+    import datetime
+
     with fits.open(control_path) as hdul:
         header = hdul[0].header
-        print(f"Sector: {header.get('SECTOR')}, Camera: {header.get('CAMERA')}, CCD: {header.get('CCD')}, Timestamp: {header.get('TIMESTAMP')}")
-    # Sector: None, Camera: 1, CCD: 4, Timestamp: None Yeah whatever. This gives me what I need!
-    # 2018292095939 == 2018-09-20T09:59:39, which matches the timestamp in the filename. So we can be confident that we're looking at the correct image and that the metadata is consistent with our expectations.
+        timestamp = header.get('DATE-OBS', 'Unknown')
+        #sector = header.get('SECTOR', 'Unknown') # This field doesn't exist. Let's parse it from the filename instead.
+        camera = header.get('CAMERA', 'Unknown')
+        ccd = header.get('CCD', 'Unknown')
 
-    # Let's try again without regex. It shouldn't be that hard!
-    import datetime
-    def extract_metadata(filename):
-        parts = filename.split('-')
-        timestamp = parts[0][4:]  # Remove 'tess' prefix
-        sector = int(parts[1][1:])     # Remove 's' prefix
-        camera = int(parts[2])        # Camera number
-        ccd = int(parts[3])           # CCD number
-        #timestamp = datetime.datetime.strptime(timestamp, "%Y%m%d%H%M%S")
-        # That parser *almost* works. It has a snag though:
-        # 2018292095939 -> 2018 29 20 9 59 39
-        # There's an odd number of values. I suppose the hour is the variable...?
-        # Let's add a leading zero to the hour.
-        timestamp = timestamp[:8] + timestamp[8:].zfill(6)  # Ensure the time part is 6 digits (HHMMSS)
-        #timestamp = datetime.datetime.strptime(timestamp, "%Y%m%d%H%M%S")
+        sector = control_path.stem.split('-')[1][1:]  # Extract sector from filename (remove 's' prefix)
 
-        return timestamp, sector, camera, ccd
-
-    def format_metadata(timestamp, sector, camera, ccd):
-        #return f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
-        return f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}"
-
-    title = format_metadata(*extract_metadata(control_path.name))
-    fig.suptitle(title, color='white')
+        timestamp = datetime.datetime.fromisoformat(timestamp)
+        timestamp = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        title = f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}"
+        
+        fig.suptitle(title, color='white')
 
     fig.tight_layout()
     plt.show()
