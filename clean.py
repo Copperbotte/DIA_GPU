@@ -63,7 +63,6 @@ cdedir = Path(cdedir)#.mkdir(parents=True, exist_ok=True)
 rawdir = Path(rawdir)#.mkdir(parents=True, exist_ok=True)
 clndir = Path(clndir)#.mkdir(parents=True, exist_ok=True)
 
-#sample every how many pixels? usually 32x32 is OK but it can be larger or smaller
 pix = 32 # UPDATE HERE FOR BACKGROUND SPACING
 axs = 2048 # UPDATE HERE FOR IMAGE AXIS SIZE
 ###END UPDATE INFORMATION###
@@ -105,7 +104,6 @@ rhead['CRPIX1'] = 1001.
 rhead['NAXIS1'] = 2048
 rhead['NAXIS2'] = 2048
 
-#sample every how many pixels?
 bxs = 512 #how big do you want to make the boxes for each image?
 #bxs = axs # Do nothing #WARNING: O(n^3) 
 #bxs = 1024
@@ -173,7 +171,6 @@ class ProfileTimer:
     #             self.start_times[key] = None
 
     def get_elapsed_times(self):
-        np = numpy
         secs = {key: np.array(elapsed) / 1e9 for key, elapsed in self.elapsed_times.items()}  # Convert nanoseconds to seconds
         return {key: [np.mean(elapsed), np.std(elapsed), len(elapsed)] for key, elapsed in secs.items()}  # Return average time for each key
     
@@ -398,7 +395,7 @@ def sigma_clip_numba(data, clip_low, clip_high):
                 data[j] = v
                 j += 1
         if j == size:
-            return size, lo, hi
+            return size, lo, hi, std
         size = j
 
 
@@ -438,7 +435,7 @@ def sigma_clip_mask_numba(data, mask, clip_low, clip_high):
                 mask[i] = False
                 changed += 1
         if changed == 0:
-            return size, lo, hi
+            return size, lo, hi, std
         size -= changed
 
 import subprocess as sp
@@ -1260,27 +1257,31 @@ class CUDASigmaClipBatched:
 
 
 def big_cleanup():
-    # prevent memory thrashing by preallocating arrays for the background and sigma
-    # Is thrashing the right term here? A better term might be "overhead from repeated allocations" or "performance degradation from dynamic memory management"
-    res = numpy.empty(shape=(axs, axs), dtype=float) #holder for the background 'image'
-    res_orig = numpy.empty_like(res, dtype=float) # separate output buffer for the original RBF, for comparison
+    # Pre-allocate output buffers outside the per-frame loop to avoid
+    # repeated allocation/deallocation ("thrashing").  These are reused
+    # for every frame — just .fill(0) at the start of each iteration.
+    res = np.empty(shape=(axs, axs), dtype=float) #holder for the background 'image'
+    res_orig = np.empty_like(res, dtype=float) # separate output buffer for the original RBF, for comparison
     res_cuda_f64 = np.empty_like(res, dtype=np.float64) # was f32, truncating the f64 output from evaluate()
     res_cuda_f64s = np.empty_like(res, dtype=np.float64) # separate output buffer for the f64 storage kernel, for comparison
     res_cuda_f32 = np.empty_like(res, dtype=np.float64) # was f32, truncating the f32 output from evaluate()
 
     nboxes = int((axs//bxs)**2)
-    bck = numpy.empty(shape=(nboxes,), dtype=float) #get the holder for the image background
-    sbk = numpy.empty(shape=(nboxes,), dtype=float) #get the holder for the sigma of the image background
+    naxis = int(axs//bxs)
+    bck = np.empty(shape=(naxis,naxis), dtype=float) #get the holder for the image background
+    sbk = np.empty(shape=(naxis,naxis), dtype=float) #get the holder for the sigma of the image background
+    #bck = np.empty(shape=(nboxes,), dtype=float) #get the holder for the image background
+    #sbk = np.empty(shape=(nboxes,), dtype=float) #get the holder for the sigma of the image background
 
-    x = numpy.empty(shape=(int(sze),), dtype=float)
-    y = numpy.empty(shape=(int(sze),), dtype=float)
-    v = numpy.empty(shape=(int(sze),), dtype=float)
-    s = numpy.empty(shape=(int(sze),), dtype=float)
+    x = np.empty(shape=(int(sze),), dtype=float)
+    y = np.empty(shape=(int(sze),), dtype=float)
+    v = np.empty(shape=(int(sze),), dtype=float)
+    s = np.empty(shape=(int(sze),), dtype=float)
 
-    xi = numpy.linspace(0, bxs-1, bxs)
-    yi = numpy.linspace(0, bxs-1, bxs)
-    XI, YI = numpy.meshgrid(xi, yi)
-    XYI = numpy.array(list(zip(XI.flatten(), YI.flatten())))
+    xi = np.linspace(0, bxs-1, bxs)
+    yi = np.linspace(0, bxs-1, bxs)
+    XI, YI = np.meshgrid(xi, yi)
+    XYI = np.array(list(zip(XI.flatten(), YI.flatten())))
 
     # Pre-allocated buffers for sigma-clipping variants (reused every chunk)
     n_chunk = bxs * bxs
@@ -1352,7 +1353,7 @@ def big_cleanup():
             with timers['wcs_and_cutout']:
                 w = WCS(header)
                 cut = Cutout2D(orgimg, (1068,1024), (axs, axs), wcs = w)
-                bigimg = cut.data
+                bigimg = cut.data.astype(np.float64)
 
             #update the header
             header['CRPIX1'] = 1001.
@@ -1360,124 +1361,79 @@ def big_cleanup():
             header['NAXIS2'] = 2048
 
             #get the holders ready
-            #res = numpy.zeros(shape=(axs, axs), dtype=float) #holder for the background 'image'
+            #res = np.zeros(shape=(axs, axs), dtype=float) #holder for the background 'image'
             #nboxes = int((axs//bxs)**2)
-            #bck = numpy.zeros(shape=(nboxes,), dtype=float) #get the holder for the image backgroudn
-            #sbk = numpy.zeros(shape=(nboxes,), dtype=float) #get the holder for the sigma of the image background
+            #bck = np.zeros(shape=(nboxes,), dtype=float) #get the holder for the image backgroudn
+            #sbk = np.zeros(shape=(nboxes,), dtype=float) #get the holder for the sigma of the image background
             with timers['preallocating']:
                 res.fill(0.0)
                 bck.fill(0.0)
                 sbk.fill(0.0)
 
             with timers['flat_and_bias_subtraction']:
-                #remove the flat and the bias
                 if (biassub == 1) and (flatdiv == 1):
-                    bigimg = bigimg - bias #subtract the bias
-                    bigimg = bigimg/flat #subtract the flat
+                    bigimg = bigimg - bias
+                    bigimg = bigimg/flat
 
-            with timers['total_background_subtraction_chunking']:
+            with timers['total_background_sigma_clipping']:
                 tts = 0
                 for oo in range(0, axs, bxs): # Chunks of the image in the x direction
                     for ee in range(0, axs, bxs): # Chunks of the image in the y direction
                         print(f"{axs = }, {bxs = }, {oo = }, {ee = }")
                         with timers['image_chunking']:
                             img = bigimg[ee:ee+bxs, oo:oo+bxs] #split the image into small subsections
+                            #sc_cimg[:] = bigimg[ee:ee+bxs, oo:oo+bxs].ravel() #split the image into small subsections.ravel()
                         
+                        # warm start numba + CUDA sigma clip
+                        if oo == 0 and ee == 0: #if tts == 0:
+                            sc_cimg[:] = bigimg[:bxs,:bxs].ravel() #split the image into small subsections.ravel()
+                            cnum, clow, chigh, cstd = sigma_clip_mask_numba(sc_cimg, sc_mask, 2.5, 2.5)
+
                         #calculate the sky statistics
                         with timers['sky_stats_sigmaclip']:
-                            cimg0, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
-
-                        with timers['sky_stats_sigmaclip_manual']:
-                            #cimg, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
-                            clip_low, clip_high = 2.5, 2.5
-                            clow, chigh = None, None
-                            cimg = img.copy().ravel()
-                            while True:
-                                c_std = numpy.std(cimg)
-                                c_mean = numpy.mean(cimg)
-                                size = len(cimg)
-                                clow = c_mean - c_std * clip_low
-                                chigh = c_mean + c_std * clip_high
-                                cimg = cimg[(cimg >= clow) & (cimg <= chigh)]
-                                delta = size - len(cimg)
-                                if delta == 0:
-                                    break
-                        cimg1 = cimg.copy()  # separate output buffer for the manual sigma clip, for comparison
-                        
-                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg1) = } "
-                        if len(cimg0) == len(cimg1):
-                            report += f"{np.abs(cimg1 - cimg0).max() = }"
-                        print(report)
-                        
-                        with timers['sky_stats_astropy_sigma_clip']:
-                            cimg_astropy_result = astropy_sigma_clip(
-                                img.ravel(), sigma=2.5, maxiters=None,
-                                cenfunc='mean', stdfunc='std',
-                            )
-                            #with timers['sky_stats_astropy_sigma_clip___compressed']:
-                            cimg_astropy = cimg_astropy_result.compressed()
-
-                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_astropy) = } "
-                        if len(cimg0) == len(cimg_astropy):
-                            report += f"{np.abs(cimg_astropy - cimg0).max() = }"
-                        print(report)
-
-                        # warm start numba + CUDA sigma clip
-                        if tts == 0:
-                            sc_cimg[:] = img.ravel()
-                            count_nb, lo_nb, hi_nb = sigma_clip_numba(sc_cimg, 2.5, 2.5)
-                            count_nbm, lo_nbm, hi_nbm = sigma_clip_mask_numba(sc_cimg, sc_mask, 2.5, 2.5)
-                            count_nbm, lo_nbm, hi_nbm = sigma_clip_mask_numba(sc_cimg.astype(np.float32), sc_mask, 2.5, 2.5)
-                            # Warm up CUDA sigma clip (first launch has extra driver overhead)
-                            #sc_cimg[:] = img.ravel()
-                            #_mask_cu, _cnt_cu, _lo_cu, _hi_cu = cuda_sigclip(sc_cimg, 2.5, 2.5)
-                            #_mask_cu32, _cnt_cu32, _lo_cu32, _hi_cu32 = cuda_sigclip_f32(sc_cimg, 2.5, 2.5)
-
-
-                        with timers['sky_stats_sigma_clip_numba']:
-                            sc_cimg[:] = img.ravel()
-                            count_nb, lo_nb, hi_nb = sigma_clip_numba(sc_cimg, 2.5, 2.5)
-                            cimg_numba = sc_cimg[:count_nb].copy()
-
-                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_numba) = } "
-                        if len(cimg0) == len(cimg_numba):
-                            report += f"{np.abs(np.sort(cimg_numba) - np.sort(cimg0)).max() = }"
-                        print(report)
-
-                        with timers['sky_stats_sigma_clip_mask_numba']:
-                            sc_cimg[:] = img.ravel()
-                            count_nbm, lo_nbm, hi_nbm = sigma_clip_mask_numba(sc_cimg, sc_mask, 2.5, 2.5)
-                            cimg_numba_mask = sc_cimg[sc_mask]
-
-                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_numba_mask) = } "
-                        if len(cimg0) == len(cimg_numba_mask):
-                            report += f"{np.abs(cimg_numba_mask - cimg0).max() = }"
-                        print(report)
-
-                        with timers['sky_stats_sigma_clip_mask_numba_f32']:
-                            with timers['sky_stats_sigma_clip_mask_numba_f32___cast']:
-                                sc_cimg_f32[:] = img.ravel().astype(np.float32)
-                            count_nbm_f32, lo_nbm_f32, hi_nbm_f32 = sigma_clip_mask_numba(sc_cimg_f32, sc_mask, 2.5, 2.5)
-                            cimg_numba_mask_f32 = sc_cimg[sc_mask]
-
-
-                        cimg = cimg0 #Keep the output the control value for now
+                            #cimg0, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
+                            sc_cimg[:] = img.ravel().astype(np.float64)
+                            cnum, clow, chigh, cstd = sigma_clip_mask_numba(sc_cimg, sc_mask, 2.5, 2.5)
+                            cimg1 = sc_cimg[sc_mask]  # apply the mask to get the clipped values
+                            
+                            #report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg1) = } "
+                            #if len(cimg0) == len(cimg1):
+                            #    report += f"{np.abs(cimg1 - cimg0).max() = }"
+                            #else:
+                            #    report += f"DIFF count: {len(cimg1)} vs {len(cimg0)} (delta={len(cimg1)-len(cimg0)})"
+                            #print(report)
+                        cimg = cimg1
 
 
                         with timers['sky_stats_median']:
-                            sky = numpy.median(cimg) #determine the sky value
+                            sky = np.median(cimg) #determine the sky value
                         with timers['sky_stats_std']:
-                            sig = numpy.std(cimg) #determine the sigma(sky)
+                            #sig = np.std(cimg) #determine the sigma(sky)
+                            sig = cstd
                         
                         with timers['background_storage']:
-                            bck[tts] = sky #insert the image median background
-                            sbk[tts] = sig #insert the image sigma background
+                            bck[oo//bxs, ee//bxs] = sky #insert the image median background
+                            sbk[oo//bxs, ee//bxs] = sig #insert the image sigma background
+                            #bck[tts] = sky #insert the image median background
+                            #sbk[tts] = sig #insert the image sigma background
+                            tts += 1
+
+            with timers['median_background_calculation']:
+                mbck = np.median(bck)
+                sbck = np.median(sbk)
+
+            with timers['total_background_subtraction_chunking']:
+                for oo in range(0, axs, bxs): # Chunks of the image in the x direction
+                    for ee in range(0, axs, bxs): # Chunks of the image in the y direction
+                        print(f"{axs = }, {bxs = }, {oo = }, {ee = }")
+                        img = bigimg[ee:ee+bxs, oo:oo+bxs]
+                        sig = sbk[oo//bxs, ee//bxs] #get the sigma for this chunk # retrieve this chunk's σ from pass 1
 
                         #create holder arrays for good and bad pixels
-                        # x = numpy.zeros(shape=(int(sze),), dtype=float)
-                        # y = numpy.zeros(shape=(int(sze),), dtype=float)
-                        # v = numpy.zeros(shape=(int(sze),), dtype=float)
-                        # s = numpy.zeros(shape=(int(sze),), dtype=float)
+                        # x = np.zeros(shape=(int(sze),), dtype=float)
+                        # y = np.zeros(shape=(int(sze),), dtype=float)
+                        # v = np.zeros(shape=(int(sze),), dtype=float)
+                        # s = np.zeros(shape=(int(sze),), dtype=float)
                         with timers['preallocating inner']:
                             x.fill(0.0)
                             y.fill(0.0)
@@ -1485,29 +1441,27 @@ def big_cleanup():
                             s.fill(0.0)
                         nd = 0
             
-                        #begin the sampling of the "local" sky value
                         with timers['local_sky_sampling']:
                             for jj in range(0, bxs+pix, pix):
                                 for kk in range(0,bxs+pix, pix):
-                                    il = numpy.amax([jj-lop,0])
-                                    ih = numpy.amin([jj+lop, bxs-1])
-                                    jl = numpy.amax([kk-lop, 0])
-                                    jh = numpy.amin([kk+lop, bxs-1])
+                                    il = np.amax([jj-lop,0])
+                                    ih = np.amin([jj+lop, bxs-1])
+                                    jl = np.amax([kk-lop, 0])
+                                    jh = np.amin([kk+lop, bxs-1])
                                     c = img[jl:jh, il:ih]
                                     #select the median value with clipping
                                     cc, cclow, cchigh = scipy.stats.sigmaclip(c, low=2.5, high = 2.5) #sigma clip the background
-                                    lsky = numpy.median(cc) #the sky background
-                                    ssky = numpy.std(cc) #sigma of the sky background
-                                    x[nd] = numpy.amin([jj, bxs-1]) #determine the pixel to input
-                                    y[nd] = numpy.amin([kk, bxs-1]) #determine the pixel to input
+                                    lsky = np.median(cc) #the sky background
+                                    ssky = np.std(cc) #sigma of the sky background
+                                    x[nd] = np.amin([jj, bxs-1]) #determine the pixel to input
+                                    y[nd] = np.amin([kk, bxs-1]) #determine the pixel to input
                                     v[nd] = lsky #median sky
                                     s[nd] = ssky #sigma sky
                                     nd = nd + 1
 
-                        #now we want to remove any possible values which have bad sky values
                         with timers['bad_sky_removal']:
-                            rj = numpy.where(v <= 0) #stuff to remove
-                            kp = numpy.where(v > 0) #stuff to keep
+                            rj = np.where(v <= 0) #stuff to remove
+                            kp = np.where(v > 0) #stuff to keep
 
                         with timers['bad_sky_removal_interpolation']:
                             if (len(rj[0]) > 0):
@@ -1529,23 +1483,22 @@ def big_cleanup():
                                     pp = sorted(range(len(rd)), key = lambda k:rd[k])
                                     #use the closest 10 points to get a median
                                     vnear = vgood[pp[0:9]]
-                                    ave = numpy.median(vnear)
+                                    ave = np.median(vnear)
                                     #insert the good value into the array
                                     v[idx] = ave
 
                         with timers['bad_sky_removal_interpolation_bad_sigmas']:
-                            #now we want to remove any possible values which have bad sigmas
-                            rjs = numpy.where(s >= 2*sig)
+                            rjs = np.where(s >= 2*sig)
                             rj  = rjs[0]
-                            kps = numpy.where(s < 2*sig)
+                            kps = np.where(s < 2*sig)
                             kp  = kps[0]
 
                             if (len(rj) > 0):
                                 #keep only the good points
-                                xgood = numpy.array(x[kp])
-                                ygood = numpy.array(y[kp])
-                                vgood = numpy.array(v[kp])
-                                sgood = numpy.array(s[kp])
+                                xgood = np.array(x[kp])
+                                ygood = np.array(y[kp])
+                                vgood = np.array(v[kp])
+                                sgood = np.array(s[kp])
 
                                 for jj in range(0, len(rj)):
                                     #select the bad point
@@ -1554,26 +1507,21 @@ def big_cleanup():
                                     ybad = y[idx]
                                     #print xbad, ybad
                                     #use the distance formula to get the closest points
-                                    rd = numpy.sqrt((xgood-xbad)**2.+(ygood-ybad)**2.)
+                                    rd = np.sqrt((xgood-xbad)**2.+(ygood-ybad)**2.)
                                     #sort the radii
                                     pp = sorted(range(len(rd)), key = lambda k:rd[k])
                                     #use the closest 10 points to get a median
                                     vnear = vgood[pp[0:9]]
-                                    ave = numpy.median(vnear)
+                                    ave = np.median(vnear)
                                     #insert the good value into the array
                                     v[idx] = ave
 
-                        #now we interpolate to the rest of the image with a thin-plate spline    
-                        #xi = numpy.linspace(0, bxs-1, bxs)
-                        #yi = numpy.linspace(0, bxs-1, bxs)
-                        #XI, YI = numpy.meshgrid(xi, yi)
                         with timers['rbf_creation']:
                             #rbf = Rbf(x, y, v, function = 'thin-plate', smooth = 0.0)
                             rbf = scipy_interp.RBFInterpolator(list(zip(x, y)), v, kernel='thin_plate_spline', smoothing=0.0, degree=1)
                             globals().update(locals())
                         with timers['rbf_interpolation']:
                             #reshld_OLD = rbf(XYI).reshape(XI.shape)
-                            pass
                             globals().update(locals())
 
                         # with timers['OLD_rbf_creation']:
@@ -1620,24 +1568,15 @@ def big_cleanup():
                             res_cuda_f64[ee:ee+bxs, oo:oo+bxs]  = reshld_cuda_f64
                             res_cuda_f64s[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64s
                             res_cuda_f32[ee:ee+bxs, oo:oo+bxs]  = reshld_cuda_f32
-                            tts = tts+1
+                            #tts = tts+1
                             #return
-
-            with timers['median_background_calculation']:
-                #get the median background
-                mbck = numpy.median(bck)
-                sbck = numpy.median(sbk)
         
             with timers['sky_gradient_subtraction']:
-                #subtract the sky gradient and add back the median background
-                #sub = bigimg-res_orig # Switch to res from the original. It should be faster to iterate now!
                 sub = bigimg-res 
                 #sub = bigimg-res_cuda_f32 # Switch to res from the original. It should be faster to iterate now!
+                #sub = bigimg-res_cuda_f64
                 sub = sub + mbck
-
-            #align the image
-            # NOTE: `hcongrid` was originally used for alignment. If available,
-            # uncomment the import at the top and ensure the function is on PATH.
+                
             with timers['hcongrid_alignment']:
                 algn = hcongrid(sub, header, rhead)
 
@@ -1821,15 +1760,16 @@ plt.show()
 # That's the control path. I'm unfamiliar with the path api. How do I do it in a way that works with what we did above?
 # We're using a different clndir instead of the one above. Let's redefine it so we can change the one above later.
 
-cldir_ctrl = Path('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/DIA_TEMP/clean')
+#cldir_ctrl = Path('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/DIA_TEMP/clean')
+cldir_ctrl = ROOT / "DIA_TEMP" / "clean2"
 control_path = cldir_ctrl / 'tess2018292095939-s0004-1-4-0124-s_ffic_sa.fits'
+print(f"Control path: {control_path}")
+print(f"Output path: {outpath}")
 
 with fits.open(control_path) as hdul:
     control_image = hdul[0].data
 with fits.open(outpath) as hdul:
     test_image = hdul[0].data
-
-
 
 
 rel_error = np.abs(test_image - control_image)
@@ -1838,7 +1778,8 @@ rel_error = np.where(rel_error == 0, rel_error, rel_error / np.abs(control_image
 print(f"Max abs relative error: {np.max(rel_error):.3e}")
 
 def slog(img):
-    result = np.log(img)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        result = np.log(img)
     # Find the value that is the smallest non nan, non inf value in the image
     mask = np.isfinite(result) 
     #vmin = result[mask].min() # ValueError: zero-size array to reduction operation minimum which has no identity
@@ -1848,7 +1789,9 @@ def slog(img):
 
 # Simple log luminance tonemapper. Taken from visualizer.py.
 def tonemap(img):
-    ld = np.log(img)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        #ld = np.log(img)
+        ld = slog(img)
     ld_fltr = ld[~np.isnan(ld) & ~np.isinf(ld)]
     ld_nan = np.nan_to_num(ld, nan=np.nanmax(ld_fltr), neginf=np.nanmin(ld_fltr), posinf=np.nanmax(ld_fltr))
     histo, bin_edges = np.histogram(ld_nan, bins=4096)
@@ -1882,44 +1825,22 @@ def plots():
     ax[2].set_title("Test image (tonemapped)")
     ax[2].imshow(tonemap(test_image), **imgargs)
 
-    # Let's add a global descriptor for the Sector, Camera, CCD, and timestamp from the filename. This will help us confirm that we're looking at the correct image and provide context for the comparison.
-    import re
-    filename_pattern = r'tess(\d{13})-s(\d{4})-c(\d)-ccd(\d)-\d{4}-s_ffic_sa\.fits'
-    match = re.match(filename_pattern, control_path.name)
-    if match:
-        timestamp, sector, camera, ccd = match.groups()
-        fig.suptitle(f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}", color='white')
-    # Lets check this from the file directly.
+    import datetime
+
     with fits.open(control_path) as hdul:
         header = hdul[0].header
-        print(f"Sector: {header.get('SECTOR')}, Camera: {header.get('CAMERA')}, CCD: {header.get('CCD')}, Timestamp: {header.get('TIMESTAMP')}")
-    # Sector: None, Camera: 1, CCD: 4, Timestamp: None Yeah whatever. This gives me what I need!
-    # 2018292095939 == 2018-09-20T09:59:39, which matches the timestamp in the filename. So we can be confident that we're looking at the correct image and that the metadata is consistent with our expectations.
+        timestamp = header.get('DATE-OBS', 'Unknown')
+        #sector = header.get('SECTOR', 'Unknown') # This field doesn't exist. Let's parse it from the filename instead.
+        camera = header.get('CAMERA', 'Unknown')
+        ccd = header.get('CCD', 'Unknown')
 
-    # Let's try again without regex. It shouldn't be that hard!
-    import datetime
-    def extract_metadata(filename):
-        parts = filename.split('-')
-        timestamp = parts[0][4:]  # Remove 'tess' prefix
-        sector = int(parts[1][1:])     # Remove 's' prefix
-        camera = int(parts[2])        # Camera number
-        ccd = int(parts[3])           # CCD number
-        #timestamp = datetime.datetime.strptime(timestamp, "%Y%m%d%H%M%S")
-        # That parser *almost* works. It has a snag though:
-        # 2018292095939 -> 2018 29 20 9 59 39
-        # There's an odd number of values. I suppose the hour is the variable...?
-        # Let's add a leading zero to the hour.
-        timestamp = timestamp[:8] + timestamp[8:].zfill(6)  # Ensure the time part is 6 digits (HHMMSS)
-        #timestamp = datetime.datetime.strptime(timestamp, "%Y%m%d%H%M%S")
+        sector = control_path.stem.split('-')[1][1:]  # Extract sector from filename (remove 's' prefix)
 
-        return timestamp, sector, camera, ccd
-
-    def format_metadata(timestamp, sector, camera, ccd):
-        #return f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
-        return f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}"
-
-    title = format_metadata(*extract_metadata(control_path.name))
-    fig.suptitle(title, color='white')
+        timestamp = datetime.datetime.fromisoformat(timestamp)
+        timestamp = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        title = f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}"
+        
+        fig.suptitle(title, color='white')
 
     fig.tight_layout()
     plt.show()
@@ -1928,32 +1849,4 @@ def plots():
 plots()
 
 
-# Visualize one step of sigma clip via sigma masking
-img = bigimg[1732:1959,126:361]
-
-with timers['sky_stats_sigmaclip_manual']:
-    #cimg, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
-    clip_low, clip_high = 2.5, 2.5
-    clow, chigh = None, None
-    cimg = img.copy().ravel()
-    while True:
-        c_std = numpy.std(cimg)
-        c_mean = numpy.mean(cimg)
-        size = len(cimg)
-        clow = c_mean - c_std * clip_low
-        chigh = c_mean + c_std * clip_high
-        cimg = cimg[(cimg >= clow) & (cimg <= chigh)]
-        delta = size - len(cimg)
-        if delta == 0:
-            break
-
-
-
-img = bigimg[1732:1959,126:361]
-std = np.std(img)
-mean = np.mean(img)
-clow = mean - std * 2.5
-chigh = mean + std * 2.5
-
-mask = np.wh
 
