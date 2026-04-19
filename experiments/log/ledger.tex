@@ -1,0 +1,273 @@
+% ****** Start of file apssamp.tex ******
+%
+%   This file is part of the APS files in the REVTeX 4.2 distribution.
+%   Version 4.2a of REVTeX, December 2014
+%
+%   Copyright (c) 2014 The American Physical Society.
+%
+%   See the REVTeX 4 README file for restrictions and more information.
+%
+% TeX'ing this file requires that you have AMS-LaTeX 2.0 installed
+% as well as the rest of the prerequisites for REVTeX 4.2
+%
+% See the REVTeX 4 README file
+% It also requires running BibTeX. The commands are as follows:
+%
+%  1)  latex apssamp.tex
+%  2)  bibtex apssamp
+%  3)  latex apssamp.tex
+%  4)  latex apssamp.tex
+%
+\documentclass[%
+ reprint,
+%superscriptaddress,
+%groupedaddress,
+%unsortedaddress,
+%runinaddress,
+%frontmatterverbose, 
+%preprint,
+%preprintnumbers,
+%nofootinbib,
+%nobibnotes,
+%bibnotes,
+ amsmath,amssymb,
+ aps,
+%pra,
+%prb,
+%rmp,
+%prstab,
+%prstper,
+%floatfix,
+showkeys,
+]{revtex4-2}
+
+\usepackage{graphicx}% Include figure files
+\graphicspath{{./images/}}
+\usepackage{dcolumn}% Align table columns on decimal point
+\usepackage{bm}% bold math
+\usepackage{verbatim}
+\usepackage{hyperref}% add hypertext capabilities
+\usepackage{soul} % for strikethroughs with \st
+\usepackage{marginnote}
+\usepackage{url}
+\usepackage{listings}
+\usepackage{gensymb}
+\usepackage{enumitem} % for customizing lists, e.g. to get a) b) c) instead of 1) 2) 3)
+%\usepackage[mathlines]{lineno}% Enable numbering of text and display math
+%\linenumbers\relax % Commence numbering lines
+%\usepackage[showframe,%Uncomment any one of the following lines to test 
+%%scale=0.7, marginratio={1:1, 2:3}, ignoreall,% default settings
+%%text={7in,10in},centering,
+%margin=1.5in,
+%%total={6.5in,8.75in}, top=1.2in, left=0.9in, includefoot,
+%%height=10in,a5paper,hmargin={3cm,0.8in},
+%]{geometry}
+%\providecommand{\keywords}[1]
+%{
+% \small
+%  \textbf{\textit{Keywords---}} #1
+%}
+
+%https://tex.stackexchange.com/questions/98028/bar-vs-overline-when-to-use-what-semantically
+\newcommand*\mean[1]{\bar{#1}}
+\newcommand*\pwrap[1]{\left(#1\right)}
+\newcommand*\bwrap[1]{\left[#1\right]}
+\newcommand*\vwrap[1]{\left\langle#1\right\rangle}
+\newcommand*\awrap[1]{\left|#1\right|}
+\newcommand*\set[1]{\left\{#1\right\}}
+
+\newcommand*\To{\Rightarrow} % For consistency with \to
+
+\newcommand*\vvec[2]{\begin{bmatrix}#1\\#2\end{bmatrix}}
+\newcommand*\vvvec[3]{\begin{bmatrix}#1\\#2\\#3\end{bmatrix}}
+
+% Horizontal vectors. Haha I'm so clever hahhahahhahhah guh
+\newcommand*\hhec[2]{\begin{bmatrix}#1 & #2\end{bmatrix}}
+\newcommand*\hhhec[3]{\begin{bmatrix}#1 & #2 & #3\end{bmatrix}}
+
+
+% Can I define a value later on in the script with \newcommand, outside the preamble? Yes, but it has to be before the first use of the command. So, I can define a new command for the imaginary unit $i$ here:
+\newcommand*\im[0]{\mathbf{i}} % \newcommand*\im[0]{\mathbb{i}}
+\newcommand*\jm[0]{\mathbf{j}} % \newcommand*\jm[0]{\mathbb{j}}
+\newcommand*\km[0]{\mathbf{k}} % \newcommand*\km[0]{\mathbb{k}}
+
+\begin{document}
+\title{DIA_GPU Ledger} %: A GPU-Accelerated Direct Inversion Algorithm for Seismic Tomography} % Interesting name copilot! I'll have to look up what Direct Inversion is.
+\author{Joseph Kessler}
+
+\affiliation{Department of Physics and Astronomy, California State University, Long Beach}
+
+\date{\today} % or type a date like: \date{12 February 2026}
+
+%\begin{abstract}
+
+%\end{abstract}
+%\keywords{Multimeter, Oscilloscope, Function Generator, Shielding, Interference, Ground Loop}
+\maketitle
+\section{Motivation}
+
+I come from computer graphics / gamedev. Despite never working in the industry due to a bachelors degree requirement for most jobs, I have a ton of experience being entirely self-taught. I was a Computer Science major before the AI boom gated me from that realm entirely, and in my breif adventure into astronomy I keep seeing a striking resemblance to shader programming & technical art I have tons of experience in. My intent with this project is to glean how similar the two realms are, and if possible, perform tech transfer in both ways. I've heard that its very rare for people to go the other way like I have.
+
+Astronomy is historically a CPU-only field, as no matter the size of the datasets, the stars aren't going anywhere.  There's no pressure to compute anything efficiently nor update any code so long as it works, is maximally precise, and doesn't take infinite time.  Budgets may scale, papers may get delayed, and the stars aren't going anywhere.
+
+Contrast this to Gamedev: where you have months to have a project go from concept to shipped, it must be extremely high performance or your customers can't play it, and your code must be maintainable to grant this extreme iteration speed. Making sloppy code may help make a deadline in the short term, but plague you for decades to come as the size of your codebase balloons to beyond what any single developer can handle.  This field demands not just high compute performance but high process performance. As such, the field ends up being the art of approximation. The highest demand component of this field was real-time graphics. In the pursuit of ever higher fidelity real-time graphics, engineers in the early 2000s landed on a concept that eventually powered the AI boom: Shaders. These are embarrasingly parallelizable functions that historically, shade pixels. 
+
+
+<I need a better way to say this: For our purposes / In the context of astronomy / etc> the game that popularized the shader that piloted the design of GPUs to this day was Tron 2.0's "bloom" (2004). This is the glow effect seen throughout the movie Tron, which is mathematically a convolution.  In 2007, NVIDIA started manufacturing GPUs that allowed for programmable shaders on the GPU, which eventually lead to these pixel shaders first being repurposed to "shade" vertices, then to "shade" anything. NVIDIA's CUDA made this a first class feature (GPGPU programming), which has largely stayed a niche real-time graphics topic until the AI boom. In the meantime, the performance of these tasks roughly doubled every 3 years, and eventually neighboring fields began to notice.
+
+Two neighboring fields that could directly adapt these hardware and software innovations were Video transcoding & Offline rendering: The Movie Industry! Videos take a notoriously long time to render, and have similar throughput requirements to real-time graphics. Transforming pixels from one color space to another is literally a pixel shader! 3D animated movies & offline rendering is an identical workload to real-time graphics, but with the real-time component relaxed completely. It also relied on said video transcoders, so the film industry adopted GPUs into their render farm quite early. 
+
+% Maybe omit this section. I dont have much AI experience, I'm not made of money.
+% The AI boom directly caused a surge in demand for GPU compute, starting with Alexnet in 2012, a convolutional neural network. A kind of learned bloom. By 2017, Google released TensorFlow, which made it shockingly simple for consumers to train custom gradient descent models on their own hardware, whose bottomless demand lead to the construction of massive GPU render farms, far exceeding the compute capability of anything the film industry could muster, and most supercomputers of the world. 
+
+% same with below. HL2 & normals are a great thing to reference though...
+% of the AI boom was Half-Life 2. The shader was a simple one: it took the normal vector of a surface, and the direction of the light, and computed how much light should be reflected off that surface. This is called a "normal map" shader, and it was used to add detail to surfaces without adding more geometry. It was a simple shader, but it was a game-changer. It allowed for much higher fidelity graphics without the need for more polygons, which was a huge performance boost. This is the kind of approximation that gamedev thrives on: it's not about being perfectly accurate, it's about being good enough to look good and run well.
+
+This leads us back to astronomy. As sattelites get more and more sophisticated, and data uplink throughputs get faster and faster, the workload of astronomy is slowly falling beyond the horizon imposed by its one requirement: to not take infinite time. By imposing the slightest performance constraint, this entire field is astonishingly similar to video transcoding. By additionally imposing the real-time requirement, it looks just like gamedev. But since graphics inception, Astronomy hasn't changed much, if at all. It still relies on the Mathematician's thinking of writing something once, and never looking back. "Don't reinvent the wheel." In gamedev, \textit{we must, frequently.} Due to the shocking similarity between these realms, there's likely 40 years of technology ripe for transfer. CPU performance and GPU performance largely scale the same, but utilization of these different technologies has \textit{not}.
+
+I am not yet an astronomer, but a few of my personal projects are surprisingly similar to radio astronomy. I'm sure whatever I'll find in the process of refactoring this repo will be fruitful. If it doesn't transform the field, it'll at least transform me. 
+
+\section{Purpose of this log}
+
+This log is a record of my thought processes as I transform this codebase with game engine programming / system programming in mind. It should be easily digestable to astronomers given time. It will look alien, but isn't that exactly what you're looking for? :)
+
+\section{Basic design philosophy}
+
+This project is a heavy modification of Oelkers et. al's Difference Imaging Analysis (DIA) codebase, which preprocesses TESS's FFI images.
+
+My goal here isn't to make a singular atomic library like Astropy, its to do system programming and construct what's essentially a rendering engine to bulk process all TESS data and beyond with a completely different design philosophy to what's currently employed. This process takes a lot of time. It should be directly adaptable to the workload of the Nancy Grace Roman space telescope, with a massive reduction in the number of compute tokens required, allowing for all of those resources to be allocated elsewhere. This project is not a magic bullet. Adapting it to Roman or any other telescope will take time, so I hope this log helps convey my thought process to astronomers wanting to follow this road the other way.
+
+\section{Preliminary performance testing}
+
+Upon first observing the DIA codebase, I was drawn to the singular c file in the python directory: DIA/routines/Python/oisdifference.c. Namely, its \textbf{\textit{11 deep nested for loop.}} Any gamedev workload that scales at $O(n^{11})$ does not run in my lifetime for any meaninful dataset. We aggressively optimize anything that's $O(n^2)$ or above, which often pokes above all other bottlenecks in the profiler as framerate increases. This is what made me curious about tech transfer to astronomy in the first place. First, lets construct a set of test data of similar size to this $O(n^{11})$ loop, a convolution.
+
+I constructed 14 test cases to showcase different performance bottlenecks between my CPU and GPU. As much as I wish these tests could be fair, my CPU is very old (Intel i7 9700k (2018)) and my GPU is very new (NVIDIA RTX 3090 (2020)). 
+
+% % me: I'm curious, is there a way for me to paste code into a latex document and have it look nice? I've seen Keenan Crane do this, but I'm not sure how he does.
+% % copilot: Yes, you can use the listings package in LaTeX to include code snippets with syntax highlighting. Here's an example of how to do this:
+% \begin{lstlisting}[language=C, caption={Example of a C code snippet}]
+% #include <stdio.h>
+% int main() {
+%     printf("Hello, World!\n");
+%     return 0;
+% }
+% \end{lstlisting}
+% % This will include the C code snippet in your LaTeX document with syntax highlighting. You can customize the appearance of the code by using different options provided by the listings package. For example, you can change the color scheme, font size, and more.
+% % How do I import this package?
+% % \usepackage{listings}
+% % How about python code?
+% \begin{lstlisting}[language=Python, caption={Example of a Python code snippet}]
+% def greet(name):
+%     print(f"Hello, {name}!")
+% greet("World")
+% \end{lstlisting}
+% % How do I tune listings? I'd like to use a monospace font.
+% % You can customize the appearance of the code snippets using the options provided by the listings package. To use a monospace font, you can set the basicstyle option. Here's an example of how to do this:
+% \lstset{basicstyle=\ttfamily}
+% % This will set the basic style of the code snippets to use a monospace font. You can also customize other aspects of the code appearance, such as the color scheme, by using additional options. For example, you can set the keywordstyle option to change the color of keywords in the code:
+% \lstset{keywordstyle=\color{blue}}
+% % This will set the color of keywords in the code to blue. You can find more options and customization settings in the documentation for the listings package.
+
+% \begin{lstlisting}[language=Python, caption={Example of a Python code snippet with custom settings}, basicstyle=\ttfamily\small, keywordstyle=\color{blue}]
+% def test1_pure_python():
+%     # Use a smaller domain and extend with a multiplier
+%     w00, h00 = 128, 128
+%     array00 = np.random.random((w00, h00)).astype(np.float32)
+%     mult00 = (w0*h0) / (w00*h00)
+
+%     array1_adj = array00.copy()[:-kernel.shape[0], :-kernel.shape[1]]
+%     with TimerStats(prefix="Pure python convolution", multiplier=mult00, **TimerStats_Args) as timerStats:
+%         for timer in timerStats:
+%             with timer:
+%                 h, w = array1_adj.shape
+%                 kh, kw = kernel.shape
+%                 for u in range(h-kh):
+%                     for v in range(w-kw):
+%                         accum = np.float32(0.0)
+%                         for i in range(kh):
+%                             for j in range(kw):
+%                                 accum += array0[u+i, v+j] * kernel[i, j]
+%                         array1_adj[u, v] = accum
+%         Statistics_Results[1] = timerStats.stats
+%     print()
+%     globals().update(locals())
+% \end{lstlisting}
+
+\subsection{Test 1: Pure Python}
+First, a fair test. In practice it never completed, so I proportionally reduced the domain from $2048^2 \to 128^2$, and extrapolated back. Due to the slow performance of this test, I opted for Test 2 to be the control.
+
+\subsection{Test 2: Numba}
+Numba is a just-in-time (JIT) compiler for Python that can often reach c-like performance. It requires you to write c-like python, which can be occasionally strange to use. 
+
+\subsection{Test 3: Numba with parallelization}
+Numba has an option to allow for CPU parallelization of loops. This has hidden overhead, but scales well here.
+
+\subsection{Test 4: Cppyy}
+Cppyy is a package that JIT compiles c/c++ code directly within python via the LLVM / Clang compiler. Numba does the same but Cppyy allows for more fine-grained control. Engine programming is systems programming, so the system that surrounds the code we're operating on matters as much as the code does. If performance here is significantly better than numba, I'll pursue it further.
+
+\subsection{Test 5: Cppyy with Multithreading}
+Same as before, but with an explicit multithreading implementation via <Algorithm> and <Thread>. Copilot frequently suggests OpenMP, but I have no experience with this tool, so it may be interesting to try in the future. Any optimizations found via OpenMP will likely be absorbed into the compiler, so its benefits are likely from a convenient API. Again, I have not looked into it.
+
+\subsection{Test 6 & 7: External GCC Compilation with and without Multithreading}
+These tests compare GCC with maximum optimizations & explicit SIMD to naiive LLVM's JIT. Any JIT implementation will likely be inferior to these methods due to -O3. The 
+command used to compile both into a single dll is:
+`g++ -shared -O3 -march=native -fopt-info-vec-optimized -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -pedantic -o convolve_cpp_ext.dll convolve_cpp_ext.cpp`
+Let me give a breif explanation for each flag.
+-shared tells the compiler to build a dynamic linked library (a .dll on Windows, or a .so on Linux) instead of an executable. This eliminates file transfer overhead by saving to a hard drive between calls. Its a systems programming optimization that no blind JIT compile or explicit executable will ever match.
+-O3 is GCC's most aggressive optimization level, on a scale of -O0 (no optimizations) to -O3. This enables a wide range of optimizations that can significantly improve performance, such as inlining functions, loop unrolling, and vectorization; at the cost of vastly increased compilation time. The stars aren't going anywhere! As long as it takes finite time, I'm sure astronomers will welcome it.
+-march=native tells the compiler to optimize the generated code for the architecture of the machine it's being compiled on. This allows the compiler to take advantage of specific features and instructions available on that architecture, which can lead to improved performance. This is a common optimization flag that can provide significant performance benefits, especially when combined with -O3.
+-fopt-info-vec-optimized tells GCC to provide information about which loops were successfully vectorized during the optimization process. This leverages CPU SIMD instructions, (Single Instruction, Multiple Data) which is hardware specifically designed for GPU-like workloads. This lets us know if these optimizations happened at all, and could be a source of elusive bugs. I have it enabled to keep an eye on it.
+-Wall enables all the common warning messages during compilation. This is a good practice to catch potential issues in the code, such as unused variables, type mismatches, and other common mistakes. It helps improve code quality and maintainability.
+-Wextra enables additional warning messages that are not included in -Wall. This can help catch even more potential issues in the code, such as unused parameters, sign comparisons, and other less common mistakes. It provides an extra layer of scrutiny to ensure code quality.
+-Wno-unused-variable and -Wno-unused-parameter disable specific warning messages about unused variables and parameters, respectively. This can be useful in cases where you intentionally have unused variables or parameters, such as when implementing an interface or when a variable is only used in certain configurations. It helps reduce noise in the warning messages while still allowing you to catch other potential issues.
+My thought process with those 4 are to enable all warnings, and then turn off the "obvious" ones, like a function that's written but never used. Duh! I dont need to be warned about dead code that I know I'm not using. Disabling these warnings helps improve the signal-to-noise ratio of warnings that matter.
+-pedantic tells the compiler to enforce strict compliance with the C++ standard. This can help catch potential issues in the code that may not be strictly compliant with the standard, such as using non-standard extensions or relying on undefined behavior. It promotes writing portable and standards-compliant code.
+-o defines the output file, and finally the set of input files.
+
+Since this is a DLL and not a function, it requires us to engineer the API to interface with it. This is where some of the systems programming that's alien to astronomy shows up. To keep things brief, I'm merely translating what the dll expects if it were called by a C function by explicitly casting variables to the format it expects. There is no free lunch here. If you want it to be more convenient, you must \textit{engineer the entire system} to be more convenient. Numba is better for that. More often than not your interface is written once, set in stone, and you walk away. Its really not that bad, but it is a lot of code. Tests 6 & 7 extend from lines 453 to 663, or 210 lines of code, (on average 105 each) compared to 29 lines for Test 3.
+
+\subsection{Tests 8 & 9: Cuda with PyCUDA, without and with a constant memory kernel}
+I opted against using CuPy, which is a GPU-accelerated drop-in replacement for NumPy, because I wanted to have more fine-grained control over the GPU code. Same design philosophy as we saw above with GCC: If we want a convenient API, we're wasting performance, and if we're using the GPU at all, we might as well write the system surrounding it too. It sounds light a sysyphusian nightmare, but its really not that bad, just a bit fluffy. Code tends to balloon from tens of lines to thousands of lines. PyCUDA behaves more similarly to OpenGL's GLSL than it does to numpy, which has similar systems programming overhead to GCC, but we can very finely control the system that surrounds it if the GPU is the bottleneck. In fact, these tests are from lines 668 - 875, or 207 lines of code for both, which is very comparable to the GCC tests above. Funnily enough, the length of text in these two logs mirrors the length of code in these two tests.
+
+\subsection{A brief explanation of CPUs and GPUs}
+
+I suppose now is a good point to give a breif explanation of how CPUs and GPUs work, and why this demands such fine detail. If you want a technical overview of how these work in terms of graphics programming, Simon Schreibt's "Render Hell 2.0" is by far the best explainer I've ever seen. He goes far into detail that I'm omitting here. https://simonschreibt.de/gat/renderhell/ Some of these optimizations are tested in Tests 10, 11, 12, 13, and 14.
+
+CPUs (Central Processing Units) are a collection of computer chips designed to perform basic arithmatic on a few bytes of data at a time. Bytes. Not megabytes, individual bytes. These bytes are processed in tiny memory cells called Registers, which operate in the \textit{pico}second range. My 9700k has 40 per core, each having a \textit{unique} function. These chips each do invidivdual, atomic tasks, like "add register A and register B, and store it in register A." or "Ask the chip that stores memory for one byte at <ID> and wait until we hear back", or "measure voltage and put it in register A". Only one of these chips is active at a time, depending on what value is set into an additional hidden register: the Instruction Register. Allowing the next instruction register be programmable instead is what makes computers Turing Complete.
+
+The language that is given to the Instruction Register is called Machine Code, and is the "natural language" of the CPU. They do not read C, C++, Python, Rust, etc; only machine code. It is not human readable. But! We can convert it 1:1 to human readable symbols called Assembly Language, which is unique per CPU architecture. For example, "add register A and register B, and store it in register A" might be represented as "ADD A, B" in Assembly. The memory load instruction might be represented as "LOAD A, <ID>". It is usually far too difficult for humans to parse, unless your Chris Sawyer, an old graphics programmer, working in security, or a hardware engineer. The program that translates Assembly to Machine Code is called an Assembler.
+
+Assembly is not easy to program. Its similar to writing commands in a terminal, but you have no memory of any kind. This very quickly leads to "Spagetti Code" that is impossible for anyone but the computer it runs on to actually understand. Dijkstra has a good essay on this topic: "Goto Statement Considered Harmful" (1968). To combat this,  High level languages were developed, which are often classified into two categories: Compiled and Interpreted.
+
+Compiled languages translate human-readable code into assembly with a program called a compiler, like the Gnu Compiler Collection (GCC), LLVM's Intermediate Representation toolchain (Clang), or Microsoft's Visual C++ compiler (MSVC). That's really the only C/C++ ones that matter. Most other compiled languages either use LLVM, or roll their own like Rust. This implies that all of the work I've done so far is a moot point when I could have instead been programming in Assembly directly, but unless I study my entire life at all the miscellaneous optimizations that these compilers can do and manually transform the code myself, I wouldn't even come close. Even if I did, the output would appear completely unrelated to the input code, and would be impossible to maintain. These are all \textit{optimizing} compilers, not just fancy assemblers. (Hence the -O3 flag!) By comparison, interpreted languages like Python or Javascript are translated by a program called an interpreter as they're read. Compilation takes time, while interpretation is free, but the compiled code is almost always faster. JIT compilers are often a happy medium. 
+
+Each collection of registers, chips, etc is called a Core. Each core does not talk to the Memory (RAM) directly. Instead, there are several layers of successively larger yet slower memory called the Cache. When the CPU requests something, it goes into the Cache too, which is physically next to the core, and is much faster than the RAM. My 9700k has 3 layers: L1 (256kb), L2 (2MB), and L3 (12MB). Engineering code to encourage Cache Hits is one of the most important optimizations of CPU code. Anything larger than these instead gets routed to the RAM, which is much slower, but vastly larger. My machine has 64GB of ram. If that isn't enough, it goes to hard disks, like an SSD, or old HDDs, etc. Those live in the terabyte range for consumer hardware, or the Petabyte range and above for cloud services and/or clusters. For our purposes, the CPU can only talk to the ram, or request data from the disk to be loaded into parts of the ram. Only the Cache is free.
+
+There are several cores in modern CPUs. Mine has 8! Wrangling them so they dont collide during operation is an entire problem in of itself that cannot be simply "@njit(paralell=True)"ed away. If a core is idle, you're wasting performance. Accessing those SIMD instructions is one way to do paralellization without having to wrangle the dining philosophers problem, but since each core has a SIMD register, doing both yields performance from both. It is more similar to programming a small cluster of computers than operating a single CPU.
+
+So, what're GPUs? Graphics Processing Units are these SIMD chips to their extreme limit. There are thousands of cores, each with colossal SIMD registers. They are designed to ONLY do parallel tasks. To do "branches" (if statements) they disable entire sections of the memory they're working with to run through each branch for all data, and throw out the half that wasn't used. GPUs also behave like programming a CPU cluster, but one that's physically distant from your computer. It has its own RAM and power supply, and transferring data to it is genuinely uploading / downloading. 
+
+This quirk is why I'm so interested in the systems programming viewpoint of astronomy. As nice as "undistort this image" would be as an atomic function, CPUs haven't been designed like that for 30 years. With respect to these tests, I opted against using CuPy, as its a blind wrapper for Numpy that runs on the GPU. It lacks any of the nuance that can plague GPU code that's intrinsic to this realm when you're forced to do high performance compute.  PyCUDA allows me to write custom CUDA programs (called kernels, just like the convolution kernels they're named after), which can be optimized for our specific use cases. This is common practice in gamedev, where we often write custom shaders to achieve specific effects. 
+
+In test 9, I swapped the generic memory for "constant memory", which is optimized for read-only access. This can significantly improve performance when the kernel is accessed frequently, as it reduces the latency of memory access.
+
+\subsection{Tests 10, 11, 12, and 13: Cuda with & without constant memory, using transfer free calls & queues}
+These tests forgo the transfer entirely and repeatedly process the same data to simulate a GPU bounded workload, without the memory bandwidth bottleneck. Test 10 doesn't use constant memory, while Test 11 does. Tests 12 and 13 do the same but with Command Queues (streams) instead of individual calls from the CPU. That is, it forgoes \textit{even the CPU sending instructions down the pipe}. These operations can be done in parallel with transfers, so its quite common to setup a pipeline to and from the GPU including the task it needs to perform.
+
+\subsection{Test 14: Memory transfers}
+This test isolates the memory transfer we disabled for tests 10-13. This simulates the IO bottleneck.
+
+\subsection{Results}
+There are 6 unique groups of data, from slowest to fastest.
+First is 1. Pure Python, taking ~10 minutes to complete this convolution.
+Next down is 2. Numba, 4. Cppyy, and 6. GCC, which are all ~3 seconds. Cppyy is has an unbelievably sharp peak, while gcc spread out a little in my tests, but they all have the same mean.
+Third is 5. Cppyy with Multithreading, 7. GCC with Multithreading, and 3. Numba with parallelization, with cppyy being noticibly slower than the other two. Gcc has higher variance than numba. For most workloads, numba appears to be as good as the highly optimized dll code.
+Fourth is 8. Cuda without constant memory, and 9 with constant memory, which are approximately the same at ~30ms per iteration, with the constant memory being mildly faster with lower variance. I believe 10 and 11 are both here too, but I can't see them in my graph. <TODO: VERIFY THIS>
+Finally, in a league entirely on their own are the two streaming memory tests. They were so fast I needed to extrapolate *down* instead of up like I did with the pure python test. They're all ~1ms per iteration, with constant memory being about twice as fast. 
+I did not test 14.
+
+Between the fastest GPU code and the slowest CPU code, there is a difference of 130,000x. This value alone is what screamed at me that astronomy is ripe for tech transfer for even the basics of graphics tech with minimal loss of precision. 6 orders of magnitude is life changing for any industry.
+
+\end{document}
+%
+% ****** End of file apssamp.tex ******
