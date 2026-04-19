@@ -13,6 +13,7 @@ import astropy
 from astropy.io import fits
 from astropy.nddata.utils import Cutout2D
 from astropy.wcs import WCS
+from astropy.stats import sigma_clip as astropy_sigma_clip
 import math
 import time
 import argparse
@@ -54,7 +55,7 @@ cdedir = ROOT / "DIA" / "routines" / "Python"
 #rawdir = ROOT / "DIA_TEMP" / "raw"
 rawdir = ROOT / "TESS_sector_4"
 #clndir = ROOT / "DIA_TEMP" / "clean"
-clndir = ROOT / "DIA_TEMP" / "clean2"
+clndir = ROOT / "DIA_TEMP" / "clean3"
 
 # ensure the output directories exist
 ROOT = Path(ROOT)#.mkdir(parents=True, exist_ok=True)
@@ -357,6 +358,84 @@ def custom_rbf_eval(x, y, XI, YI, coeffs, shift, scale):
     #return custom_rbf_eval_CPU(x, y, XI, YI, coeffs, shift, scale)
     return custom_rbf_eval_numba(x, y, XI, YI, coeffs, shift, scale)
 
+
+@numba.njit#(parallel=True)
+def sigma_clip_numba(data, clip_low, clip_high):
+    """
+    Sigma clip via in-place compaction.  Returns (count, low_bound, high_bound).
+
+    `data` is modified in-place: data[:count] holds the surviving values.
+    No sorting, no masks, no temporary arrays — just two passes per
+    iteration (stats + compact) in tight machine code.
+    """
+    size = len(data)
+    while True:
+        # Pass 1: sum and sum-of-squares in one sweep
+        s  = 0.0
+        s2 = 0.0
+        for i in range(size):
+        #for i in numba.prange(size):
+            v = data[i]
+            s  += v
+            s2 += v * v
+        mean = s / size
+        var  = s2 / size - mean * mean
+        std  = var ** 0.5
+        lo = mean - std * clip_low
+        hi = mean + std * clip_high
+
+        # Pass 2: compact survivors to the front
+        j = 0
+        for i in range(size):
+        #for i in numba.prange(size):
+            v = data[i]
+            if v >= lo and v <= hi:
+                data[j] = v
+                j += 1
+        if j == size:
+            return size, lo, hi
+        size = j
+
+
+@numba.njit(parallel=True)
+def sigma_clip_mask_numba(data, mask, clip_low, clip_high):
+    """
+    Sigma clip that produces a boolean mask instead of compacting.
+
+    `data` is read-only.  `mask` is written: True = kept, False = clipped.
+    Returns (count, low_bound, high_bound).
+
+    This is the variant you'd translate to a CUDA kernel — each pixel
+    reads its value + mask flag, writes updated mask.  No data movement.
+    """
+    n = len(data)
+    for i in range(n):
+        mask[i] = True
+    size = n
+    while True:
+        s  = 0.0
+        s2 = 0.0
+        #for i in range(n):
+        for i in numba.prange(n):
+            if mask[i]:
+                v = data[i]
+                s  += v
+                s2 += v * v
+        mean = s / size
+        var  = s2 / size - mean * mean
+        std  = var ** 0.5
+        lo = mean - std * clip_low
+        hi = mean + std * clip_high
+        changed = 0
+        #for i in range(n):
+        for i in numba.prange(n):
+            if mask[i] and (data[i] < lo or data[i] > hi):
+                mask[i] = False
+                changed += 1
+        if changed == 0:
+            return size, lo, hi
+        size -= changed
+
 import subprocess as sp
 # Prints a line ran through a subprocess how you expect it to work!
 def Call(command, getlines=False, silence=False):
@@ -533,6 +612,71 @@ void rbf_interpolate_cuda_f64(double* dst, double* src_xy, double* src_c) {
             + c_linear[2] * (v - c_shiftscale[1]) / c_shiftscale[3];
 
     dst[idx] = result;
+}
+
+// ─── Sigma-clip kernels ──────────────────────────────────────────────
+// Masked parallel reduction: one pass computes per-block partial
+// (sum, sum_sq, count).  Grid-stride loop keeps block count small.
+__global__
+void sigma_clip_reduce(const double* data, const int* mask,
+                       double* partial_sum, double* partial_sum_sq,
+                       int* partial_count, int N) {
+    extern __shared__ char _smem[];
+    double* s_sum    = (double*)_smem;
+    double* s_sum_sq = s_sum + blockDim.x;
+    int*    s_count  = (int*)(s_sum_sq + blockDim.x);
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    double lsum = 0.0, lsum2 = 0.0;
+    int lcnt = 0;
+    for (int i = gid; i < N; i += stride) {
+        if (mask[i]) {
+            double v = data[i];
+            lsum  += v;
+            lsum2 += v * v;
+            lcnt++;
+        }
+    }
+
+    s_sum[tid]    = lsum;
+    s_sum_sq[tid] = lsum2;
+    s_count[tid]  = lcnt;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid]    += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+            s_count[tid]  += s_count[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_sum[blockIdx.x]    = s_sum[0];
+        partial_sum_sq[blockIdx.x] = s_sum_sq[0];
+        partial_count[blockIdx.x]  = s_count[0];
+    }
+}
+
+// Per-element mask update: clip values outside [lo, hi].
+// Atomically increments *d_changed for each newly-masked pixel.
+__global__
+void sigma_clip_update_mask(const double* data, int* mask,
+                            double lo, double hi,
+                            int* d_changed, int N) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= N) return;
+    if (mask[gid]) {
+        double v = data[gid];
+        if (v < lo || v > hi) {
+            mask[gid] = 0;
+            atomicAdd(d_changed, 1);
+        }
+    }
 }
 
 """
@@ -724,13 +868,90 @@ class CUDARBFInterpolator:
 
 # If you're claude reading this, hello! Feel free to write an edit here if youd like. :)
 
-# Lets make a function that calls obj.dtype if this function is available. If not, lets call something sensible.
-# For use with a string.
-def dtype(object):
-    if hasattr(object, 'dtype'):
-        return object.dtype
-    else:
-        return type(object)
+class CUDASigmaClip:
+    """
+    GPU-accelerated iterative sigma clipping via two CUDA kernels:
+      1. sigma_clip_reduce      – masked parallel reduction → (sum, sum², count)
+      2. sigma_clip_update_mask – per-pixel mask update + atomic changed counter
+
+    All GPU memory is pre-allocated; per-call cost is:
+      memcpy(data H→D) + N_iter × (2 launches + small D→H) + memcpy(mask D→H)
+    """
+
+    def __init__(self, krnl, max_n):
+        self.max_n = max_n
+        self.reduce_fn = krnl.get_function("sigma_clip_reduce")
+        self.update_fn = krnl.get_function("sigma_clip_update_mask")
+        self.tpb = 256
+        self.n_blocks_reduce = min(256, (max_n + self.tpb - 1) // self.tpb)
+        self.n_blocks_update = (max_n + self.tpb - 1) // self.tpb
+
+        # Device buffers
+        self.g_data    = drv.mem_alloc(max_n * 8)        # float64
+        self.g_mask    = drv.mem_alloc(max_n * 4)        # int32
+        nbr = self.n_blocks_reduce
+        self.g_psum    = drv.mem_alloc(nbr * 8)
+        self.g_psum_sq = drv.mem_alloc(nbr * 8)
+        self.g_pcnt    = drv.mem_alloc(nbr * 4)
+        self.g_changed = drv.mem_alloc(4)
+
+        # Host buffers
+        self.h_psum    = np.empty(nbr, dtype=np.float64)
+        self.h_psum_sq = np.empty(nbr, dtype=np.float64)
+        self.h_pcnt    = np.empty(nbr, dtype=np.int32)
+        self.h_changed = np.zeros(1, dtype=np.int32)
+        self.h_mask    = np.empty(max_n, dtype=np.int32)
+        self.h_mask_ones = np.ones(max_n, dtype=np.int32)  # reusable init
+
+        # Shared memory: 2 × tpb × sizeof(double) + tpb × sizeof(int)
+        self.smem = self.tpb * 8 * 2 + self.tpb * 4
+
+    def __call__(self, data, clip_low=2.5, clip_high=2.5):
+        n = len(data)
+        nbr = self.n_blocks_reduce
+        nbu = (n + self.tpb - 1) // self.tpb
+
+        drv.memcpy_htod(self.g_data, data)
+        drv.memcpy_htod(self.g_mask, self.h_mask_ones)
+
+        block = (self.tpb, 1, 1)
+        grid_r = (nbr, 1)
+        grid_u = (nbu, 1)
+        n_i32 = np.int32(n)
+
+        while True:
+            self.reduce_fn(
+                self.g_data, self.g_mask,
+                self.g_psum, self.g_psum_sq, self.g_pcnt,
+                n_i32,
+                block=block, grid=grid_r, shared=self.smem,
+            )
+            drv.memcpy_dtoh(self.h_psum, self.g_psum)
+            drv.memcpy_dtoh(self.h_psum_sq, self.g_psum_sq)
+            drv.memcpy_dtoh(self.h_pcnt, self.g_pcnt)
+
+            total_sum = self.h_psum.sum()
+            total_sq  = self.h_psum_sq.sum()
+            total_cnt = int(self.h_pcnt.sum())
+            mean = total_sum / total_cnt
+            std  = (total_sq / total_cnt - mean * mean) ** 0.5
+            lo = mean - std * clip_low
+            hi = mean + std * clip_high
+
+            self.h_changed[0] = 0
+            drv.memcpy_htod(self.g_changed, self.h_changed)
+            self.update_fn(
+                self.g_data, self.g_mask,
+                np.float64(lo), np.float64(hi),
+                self.g_changed, n_i32,
+                block=block, grid=grid_u,
+            )
+            drv.memcpy_dtoh(self.h_changed, self.g_changed)
+            if self.h_changed[0] == 0:
+                break
+
+        drv.memcpy_dtoh(self.h_mask[:n], self.g_mask)
+        return self.h_mask[:n].astype(bool), total_cnt, lo, hi
 
 def big_cleanup():
     # prevent memory thrashing by preallocating arrays for the background and sigma
@@ -755,12 +976,36 @@ def big_cleanup():
     XI, YI = numpy.meshgrid(xi, yi)
     XYI = numpy.array(list(zip(XI.flatten(), YI.flatten())))
 
+    # Pre-allocated buffers for sigma-clipping variants (reused every chunk)
+    n_chunk = bxs * bxs
+    # -- nosort cached --
+    sc_cimg    = np.empty(n_chunk, dtype=float)
+    sc_cimg_sq = np.empty(n_chunk, dtype=float)   # x² for variance via E[x²]-E[x]²
+    sc_mask    = np.empty(n_chunk, dtype=bool)
+    # -- argsort cached --
+    sc2_cimg   = np.empty(n_chunk, dtype=float)
+    sc2_idx01  = np.empty(n_chunk, dtype=np.intp)  # forward sort permutation
+    sc2_idx10  = np.empty(n_chunk, dtype=np.intp)  # inverse permutation
+    sc2_sorted = np.empty(n_chunk, dtype=float)
+    sc2_mask   = np.empty(n_chunk, dtype=bool)
+    sc2_arange = np.arange(n_chunk, dtype=np.intp)  # constant, never changes
+    # -- argsort + cumsum: O(1) mean/var per iteration via prefix sums --
+    sc3_cimg   = np.empty(n_chunk, dtype=float)
+    sc3_idx01  = np.empty(n_chunk, dtype=np.intp)
+    sc3_idx10  = np.empty(n_chunk, dtype=np.intp)
+    sc3_sorted = np.empty(n_chunk, dtype=float)
+    sc3_sorted_sq = np.empty(n_chunk, dtype=float)  # sorted values squared, for cumsum
+    sc3_cs1    = np.empty(n_chunk + 1, dtype=float)  # prefix sum of x   (length N+1, cs1[0]=0)
+    sc3_cs2    = np.empty(n_chunk + 1, dtype=float)  # prefix sum of x²  (length N+1, cs2[0]=0)
+    sc3_mask   = np.empty(n_chunk, dtype=bool)
+
     global_t0 = time.time()
     timers = ProfileTimer()
     rbf_timer_warmup = True
     cuda_rbf = CUDARBFInterpolator(krnl, width=bxs, height=bxs, max_n_points=sze)
     cuda_rbf_f64s = CUDARBFInterpolator(krnl, width=bxs, height=bxs, max_n_points=sze, mode="f64_storage")
     cuda_rbf_f32 = CUDARBFInterpolator(krnl, width=bxs, height=bxs, max_n_points=sze, mode="f32")
+    cuda_sigclip = CUDASigmaClip(krnl, max_n=n_chunk)
 
     #begin cleaning
     for ii in range(0, nfiles):
@@ -797,7 +1042,7 @@ def big_cleanup():
             with timers['wcs_and_cutout']:
                 w = WCS(header)
                 cut = Cutout2D(orgimg, (1068,1024), (axs, axs), wcs = w)
-                bigimg = cut.data.astype(np.float64)
+                bigimg = cut.data
 
             #update the header
             header['CRPIX1'] = 1001.
@@ -827,24 +1072,368 @@ def big_cleanup():
                         print(f"{axs = }, {bxs = }, {oo = }, {ee = }")
                         with timers['image_chunking']:
                             img = bigimg[ee:ee+bxs, oo:oo+bxs] #split the image into small subsections
-                            print(f"{dtype(img) = }")
                         
                         #calculate the sky statistics
                         with timers['sky_stats_sigmaclip']:
-                            cimg, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
-                            print(f"{dtype(cimg) = }")
+                            cimg0, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
+
+                        with timers['sky_stats_sigmaclip_manual']:
+                            #cimg, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
+                            clip_low, clip_high = 2.5, 2.5
+                            clow, chigh = None, None
+                            cimg = img.copy().ravel()
+                            while True:
+                                c_std = numpy.std(cimg)
+                                c_mean = numpy.mean(cimg)
+                                size = len(cimg)
+                                clow = c_mean - c_std * clip_low
+                                chigh = c_mean + c_std * clip_high
+                                cimg = cimg[(cimg >= clow) & (cimg <= chigh)]
+                                delta = size - len(cimg)
+                                if delta == 0:
+                                    break
+                        cimg1 = cimg
+
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg1) = } "
+                        if len(cimg0) == len(cimg1):
+                            report += f"{np.abs(cimg1 - cimg0).max() = }"
+                        print(report)
+
+                        with timers['sky_stats_sigma_mask_nosort_nocache']:
+                            #cimg, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
+                            # For this variant, lets implement sigma *masking* instead of clipping. Lets test several variants of this algorithm too:
+                            # 1. Rolling value-based sigma clipping (Didn't work right due to numerical instability)
+                            # 2. Sigma masking without sorting first.
+                            # 3. Sigma masking by sorting first, and iterating to trivially cull without reallocating, then permute back to original order at the end (probably faster than repeated masking)
+                            clip_low, clip_high = 2.5, 2.5
+                            clow, chigh = None, None
+                            cimg = img.copy().ravel()
+                            c_sum = np.sum(cimg)
+                            c_mean = c_sum / len(cimg) # np.mean(cimg)
+                            c_var = np.sum((cimg - c_mean)**2) / len(cimg) # np.std(cimg)**2 == np.var(cimg) Thankfully, they dont do the 1/(N-1) correction!
+                            c_std = c_var**.5
+                            size_prev = len(cimg)
+                            c_mask = np.ones_like(cimg, dtype=bool)
+                        
+                            while True:
+                                #c_std = numpy.std(cimg)
+                                #c_mean = numpy.mean(cimg)
+                                #size = len(cimg)
+                                clow = c_mean - c_std * clip_low
+                                chigh = c_mean + c_std * clip_high
+                                #mask = (cimg >= clow) & (cimg <= chigh)
+                                #c_mask[:] 
+                                # Question: In numpy, if I want to do a boolean "and = " operation, is doing c_mask[:] &= mask the correct way to do it in-place without creating a new array? Or should I do c_mask &= mask? Or is there some other more efficient way to do it?
+                                # Copilot: Yes, using c_mask[:] &= mask is the correct way to do an in-place boolean "and" operation on the existing c_mask array without creating a new array. This will update the values of c_mask based on the logical "and" with the mask array while keeping the same memory allocation. Using c_mask &= mask would also work and is essentially equivalent in this context, as it will also perform an in-place operation. However, using c_mask[:] &= mask explicitly indicates that you are modifying the contents of the existing array, which can be clearer to read for some developers.
+                                # Let's mask *out* the outliers, so the mask masks should be true for the good values and false for the outliers. Then we can just apply the mask to cimg to get the clipped values without needing to create a new array each time.
+                                #c_mask[:] &= (cimg >= clow) & (cimg <= chigh)
+                                c_mask[:] &= ~(cimg < clow) # Mask out low outliers
+                                c_mask[:] &= ~(chigh< cimg) # Mask out high outliers
+                                #cimg = cimg[mask]
+                                size = c_mask.sum()
+                                #delta = size - len(cimg)
+                                delta = size_prev - size
+                                size_prev = size
+                                if delta == 0:
+                                    break
+                                # Recompute the mean and std using the masked values
+                                c_sum = cimg[c_mask].sum()
+                                c_mean = c_sum / size
+                                c_var = np.sum((cimg[c_mask] - c_mean)**2) / size
+                                c_std = c_var**.5
+
+                            # Compatibility with cimg for now
+                            cimg_mask = cimg[c_mask]
+                        
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_mask) = } "
+                        if len(cimg0) == len(cimg_mask):
+                            report += f"{np.abs(cimg_mask - cimg0).max() = }"
+                        print(report)
+
+                        # Sigma masking without sorting actually made the performance far worse. Let's try the argsort variant!
+                        # Before we continue, I'd like to help clarify a step of the argsort.
+                        # Each run of mean, variance requires O(n) steps, which is fine, but I'm curious if we can greatly reduce this.
+                        # So the thought is to do an argsort to get an auxilliary array first. But my issue lies there:
+                        # if [i1] -> [i2], then we build a sigma *mask* in [i2], where idx = argsort(img), which represents that -> arrow,
+                        # How do we take the solution and map it back? So, [i1] <- [i2]? 
+                        # Copilot: Yes, that's correct. After you perform the argsort to get the sorted indices (let's call it idx), you can create a boolean mask array (let's call it mask_sorted) that corresponds to the sorted order of the image values. This mask will indicate which values are within the desired sigma range. Once you have this mask in the sorted order, you can then create an inverse mapping to apply this mask back to the original order of the image values. This can be done by creating an empty boolean array (let's call it mask_original) and then filling it using the sorted indices: mask_original[idx] = mask_sorted. This way, you can effectively map the results of your sigma masking back to the original order of the image values without needing to sort or filter the original array multiple times.
+                        # Me: Well, if I use idx = argsort(img) to get the mapping from img -> idx for this kind of action, how do I build the reverse mapping? Do I start with idx0 = arange(len(img)) and then do idx0[idx] = arange(len(img)) to get the mapping from idx -> img? Or is there a more efficient way to do this?
+                        # Copilot: Yes, you can create the reverse mapping using the argsort indices. Here's how you can do it:
+                        # idx = np.argsort(img)  # This gives you the indices that would sort the array
+                        # idx_reverse = np.empty_like(idx)
+                        # idx_reverse[idx] = np.arange(len(img))  # This creates the reverse mapping
+                        # Now, idx_reverse will give you the original indices corresponding to the sorted order. So if you have a mask in the sorted order (mask_sorted), you can apply it to the original order using:
+                        # mask_original = np.empty_like(mask_sorted)
+                        # mask_original[idx] = mask_sorted  # This maps the sorted mask back to the original order
+                        
+                        with timers['sky_stats_sigma_mask_sort_nocache']:
+                            #cimg, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
+                            # For this variant, lets implement sigma *masking* instead of clipping. Lets test several variants of this algorithm too:
+                            # 1. Rolling value-based sigma clipping (Didn't work right due to numerical instability)
+                            # 2. Sigma masking without sorting first.
+                            # 3. Sigma masking by sorting first, and iterating to trivially cull without reallocating, then permute back to original order at the end (probably faster than repeated masking)
+                            clip_low, clip_high = 2.5, 2.5
+                            clow, chigh = None, None
+                            cimg = img.copy().ravel()
+                            with timers['sky_stats_sigma_mask_sort_nocache___argsort']:
+                                idx01 = np.argsort(cimg)
+                            idx10 = np.empty_like(idx01)
+                            idx10[idx01] = np.arange(len(cimg))
+                            cimg_sorted = cimg[idx01]
+                            #cimg_cs = np.cumsum(cimg_sorted) # I guess this was never used.
+                            ilow, ihigh = 0, len(cimg) # Low and high indices. If we update these, we wont *need* to mask!
+                            
+                            while True:
+                                with timers['sky_stats_sigma_mask_sort_nocache___mean']:
+                                    c_mean = cimg_sorted[ilow:ihigh].mean()
+                                with timers['sky_stats_sigma_mask_sort_nocache___std']:
+                                    c_std = cimg_sorted[ilow:ihigh].std()
+                                clow = c_mean - c_std * clip_low
+                                chigh = c_mean + c_std * clip_high
+                                # We can just move the ilow and ihigh indices to exclude the outliers without needing to create a new array or mask each time!
+                                # while ilow < ihigh and cimg_sorted[ilow] < clow:
+                                #     ilow += 1
+                                # while ilow < ihigh and cimg_sorted[ihigh - 1] > chigh:
+                                #     ihigh -= 1
+                                # Me: Alright copilot, I've got a fun challenge for you. There's a far more clever, and faster way of doing this. Your hint? Its O(log(n))!
+                                # cimg_sorted is already sorted, so no `sorter` arg needed.
+                                # Search within the active window [ilow:ihigh] and offset back.
+                                size_prev = ihigh - ilow
+                                ilow = np.searchsorted(cimg_sorted[ilow:ihigh], clow, side='left') + ilow
+                                ihigh = np.searchsorted(cimg_sorted[ilow:ihigh], chigh, side='right') + ilow
+
+                                delta = size_prev - (ihigh - ilow)
+                                if delta == 0:
+                                    break
+                            # Generate a mask and transform it back
+                            mask_sorted = np.zeros_like(cimg_sorted, dtype=bool)
+                            mask_sorted[ilow:ihigh] = True
+                            mask_sorted[:] = mask_sorted[idx10] # Map the sorted mask back to the original order
+                            # Compatibility with cimg for now (cimg is 1D, same length as mask_sorted)
+                            cimg_sort = cimg[mask_sorted]
+                        
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_sort) = } "
+                        if len(cimg0) == len(cimg_sort):
+                            report += f"{np.abs(cimg_sort - cimg0).max() = }"
+                        print(report)
+
+
+                        with timers['sky_stats_sigma_mask_nosort']:
+                            clip_low, clip_high = 2.5, 2.5
+                            sc_cimg[:] = img.ravel()
+                            np.multiply(sc_cimg, sc_cimg, out=sc_cimg_sq)  # x² once, reuse for variance
+                            sc_mask[:] = True
+                            n = n_chunk
+                            c_sum = sc_cimg.sum()
+                            c_x2  = sc_cimg_sq.sum()
+                            c_mean = c_sum / n
+                            c_var  = c_x2 / n - c_mean * c_mean
+                            c_std  = c_var ** 0.5
+                            size_prev = n
+
+                            while True:
+                                clow  = c_mean - c_std * clip_low
+                                chigh = c_mean + c_std * clip_high
+                                sc_mask &= ~(sc_cimg < clow)
+                                sc_mask &= ~(chigh < sc_cimg)
+                                size = sc_mask.sum()
+                                delta = size_prev - size
+                                size_prev = size
+                                if delta == 0:
+                                    break
+                                # Recompute stats without allocating intermediate arrays
+                                c_sum  = np.sum(sc_cimg,    where=sc_mask, initial=0.0)
+                                c_x2   = np.sum(sc_cimg_sq, where=sc_mask, initial=0.0)
+                                c_mean = c_sum / size
+                                c_var  = c_x2 / size - c_mean * c_mean
+                                c_std  = c_var ** 0.5
+
+                            cimg_mask_cached = sc_cimg[sc_mask]
+
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_mask_cached) = } "
+                        if len(cimg0) == len(cimg_mask_cached):
+                            report += f"{np.abs(cimg_mask_cached - cimg0).max() = }"
+                        print(report)
+
+                        with timers['sky_stats_sigma_mask_argsort']:
+                            clip_low, clip_high = 2.5, 2.5
+                            sc2_cimg[:] = img.ravel()
+                            with timers['sky_stats_sigma_mask_argsort___argsort']:
+                                sc2_idx01[:] = np.argsort(sc2_cimg)
+                            sc2_idx10[sc2_idx01] = sc2_arange
+                            np.take(sc2_cimg, sc2_idx01, out=sc2_sorted)
+                            ilow, ihigh = 0, n_chunk
+
+                            while True:
+                                with timers['sky_stats_sigma_mask_argsort___mean']:
+                                    c_mean = sc2_sorted[ilow:ihigh].mean()
+                                with timers['sky_stats_sigma_mask_argsort___std']:
+                                    c_std  = sc2_sorted[ilow:ihigh].std()
+                                clow  = c_mean - c_std * clip_low
+                                chigh = c_mean + c_std * clip_high
+                                size_prev = ihigh - ilow
+                                ilow  = np.searchsorted(sc2_sorted[ilow:ihigh], clow,  side='left')  + ilow
+                                ihigh = np.searchsorted(sc2_sorted[ilow:ihigh], chigh, side='right') + ilow
+                                delta = size_prev - (ihigh - ilow)
+                                if delta == 0:
+                                    break
+
+                            # Build mask in sorted order, then permute back to original order
+                            sc2_mask[:] = False
+                            sc2_mask[ilow:ihigh] = True
+                            np.take(sc2_mask, sc2_idx10, out=sc_mask)  # borrow sc_mask as output
+                            cimg_sort_cached = sc2_cimg[sc_mask]
+
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_sort_cached) = } "
+                        if len(cimg0) == len(cimg_sort_cached):
+                            report += f"{np.abs(cimg_sort_cached - cimg0).max() = }"
+                        print(report)
+
+                        with timers['sky_stats_sigma_mask_argsort_cumsum']:
+                            clip_low, clip_high = 2.5, 2.5
+                            with timers['sky_stats_sigma_mask_argsort_cumsum___ravel']:
+                                sc3_cimg[:] = img.ravel()
+                            with timers['sky_stats_sigma_mask_argsort_cumsum___argsort']:
+                                sc3_idx01[:] = np.argsort(sc3_cimg)
+                            with timers['sky_stats_sigma_mask_argsort_cumsum___inverse_idx']:
+                                sc3_idx10[sc3_idx01] = sc2_arange
+                                np.take(sc3_cimg, sc3_idx01, out=sc3_sorted)
+                            # Build prefix sums: cs1[i] = sum(sorted[0:i]), cs2[i] = sum(sorted[0:i]²)
+                            # Length N+1 so that sum(sorted[a:b]) = cs1[b] - cs1[a]
+                            with timers['sky_stats_sigma_mask_argsort_cumsum___cumsum']:
+                                sc3_cs1[0] = 0.0
+                                np.cumsum(sc3_sorted, out=sc3_cs1[1:])
+                                sc3_cs2[0] = 0.0
+                                np.multiply(sc3_sorted, sc3_sorted, out=sc3_sorted_sq)
+                                np.cumsum(sc3_sorted_sq, out=sc3_cs2[1:])
+                            ilow, ihigh = 0, n_chunk
+
+                            with timers['sky_stats_sigma_mask_argsort_cumsum___loop']:
+                                while True:
+                                    with timers['sky_stats_sigma_mask_argsort_cumsum___iter']:
+                                        # O(1) mean and std via prefix sums
+                                        n = ihigh - ilow
+                                        c_sum = sc3_cs1[ihigh] - sc3_cs1[ilow]
+                                        c_x2  = sc3_cs2[ihigh] - sc3_cs2[ilow]
+                                        c_mean = c_sum / n
+                                        c_var  = c_x2 / n - c_mean * c_mean
+                                        c_std  = np.sqrt(c_var)# ** 0.5
+                                        clow  = c_mean - c_std * clip_low
+                                        chigh = c_mean + c_std * clip_high
+                                        size_prev = n
+                                        # sc3_sorted is still intact — use it directly for O(log n) binary search
+                                        with timers['sky_stats_sigma_mask_argsort_cumsum___searchsorted']:
+                                            ilow  = np.searchsorted(sc3_sorted[ilow:ihigh], clow,  side='left')  + ilow
+                                        with timers['sky_stats_sigma_mask_argsort_cumsum___searchsorted']:
+                                            ihigh = np.searchsorted(sc3_sorted[ilow:ihigh], chigh, side='right') + ilow
+                                        delta = size_prev - (ihigh - ilow)
+                                        if delta == 0:
+                                            break
+
+                            # Build mask in sorted order, then permute back
+                            with timers['sky_stats_sigma_mask_argsort_cumsum___mask']:
+                                sc3_mask[:] = False
+                                sc3_mask[ilow:ihigh] = True
+                                np.take(sc3_mask, sc3_idx10, out=sc_mask)
+                                cimg_sort_cs = sc3_cimg[sc_mask]
+
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_sort_cs) = } "
+                        if len(cimg0) == len(cimg_sort_cs):
+                            report += f"{np.abs(cimg_sort_cs - cimg0).max() = }"
+                        print(report)
+
+                        # warm start numba + CUDA sigma clip
+                        if tts == 0:
+                            sc_cimg[:] = img.ravel()
+                            count_nb, lo_nb, hi_nb = sigma_clip_numba(sc_cimg, 2.5, 2.5)
+                            count_nbm, lo_nbm, hi_nbm = sigma_clip_mask_numba(sc_cimg, sc_mask, 2.5, 2.5)
+                            # Warm up CUDA sigma clip (first launch has extra driver overhead)
+                            sc_cimg[:] = img.ravel()
+                            _mask_cu, _cnt_cu, _lo_cu, _hi_cu = cuda_sigclip(sc_cimg, 2.5, 2.5)
+
+
+                        with timers['sky_stats_sigma_clip_numba']:
+                            sc_cimg[:] = img.ravel()
+                            count_nb, lo_nb, hi_nb = sigma_clip_numba(sc_cimg, 2.5, 2.5)
+                            cimg_numba = sc_cimg[:count_nb].copy()
+
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_numba) = } "
+                        if len(cimg0) == len(cimg_numba):
+                            report += f"{np.abs(np.sort(cimg_numba) - np.sort(cimg0)).max() = }"
+                        print(report)
+
+                        with timers['sky_stats_sigma_clip_mask_numba']:
+                            sc_cimg[:] = img.ravel()
+                            count_nbm, lo_nbm, hi_nbm = sigma_clip_mask_numba(sc_cimg, sc_mask, 2.5, 2.5)
+                            cimg_numba_mask = sc_cimg[sc_mask]
+
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_numba_mask) = } "
+                        if len(cimg0) == len(cimg_numba_mask):
+                            report += f"{np.abs(cimg_numba_mask - cimg0).max() = }"
+                        print(report)
+
+                        with timers['sky_stats_astropy_sigma_clip']:
+                            cimg_astropy_result = astropy_sigma_clip(
+                                img.ravel(), sigma=2.5, maxiters=None,
+                                cenfunc='mean', stdfunc='std',
+                            )
+                            with timers['sky_stats_astropy_sigma_clip___compressed']:
+                                cimg_astropy = cimg_astropy_result.compressed()
+
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_astropy) = } "
+                        if len(cimg0) == len(cimg_astropy):
+                            report += f"{np.abs(cimg_astropy - cimg0).max() = }"
+                        print(report)
+
+                        with timers['sky_stats_sigma_clip_cuda']:
+                            with timers['sky_stats_sigma_clip_cuda___upload']:
+                                sc_cimg[:] = img.ravel()
+                            with timers['sky_stats_sigma_clip_cuda___kernel_loop']:
+                                cuda_mask, cuda_cnt, cuda_lo, cuda_hi = cuda_sigclip(sc_cimg, 2.5, 2.5)
+                            with timers['sky_stats_sigma_clip_cuda___extract']:
+                                cimg_cuda = sc_cimg[cuda_mask]
+
+                        report = f"Chunk #{tts} ({oo}, {ee}): {len(cimg0) = } pixels after sigmaclip, {len(cimg_cuda) = } "
+                        if len(cimg0) == len(cimg_cuda):
+                            report += f"{np.abs(cimg_cuda - cimg0).max() = }"
+                        print(report)
+
+
+                        cimg = cimg1 #Keep the output the control value for now
+
+
                         with timers['sky_stats_median']:
                             sky = numpy.median(cimg) #determine the sky value
-                            print(f"dtype(sky) = ")
                         with timers['sky_stats_std']:
                             sig = numpy.std(cimg) #determine the sigma(sky)
-                            print(f"dtype(sig) = {dtype(sig)}")
 
+                        # I'm digging into the source code for scipy.stats.sigmaclip, and it calls an interesting funtion:
+                        # xp = array_namespace(a)
+                        # from scipy._lib._array_api import (_asarray, array_namespace, ...
+                        # What does array_namespace do?
+                        # Copilot: The `array_namespace` function in SciPy is a utility that determines the appropriate array namespace for a given input array. This is part of SciPy's effort to support multiple array libraries (like NumPy, CuPy, etc.) under a unified interface. When you pass an array to `array_namespace`, it checks the type of the array and returns the corresponding module that provides the array operations for that type. For example, if you pass a NumPy array, it will return the NumPy module; if you pass a CuPy array, it will return the CuPy module. This allows functions like `sigmaclip` to work seamlessly with different types of arrays without needing to hardcode support for each library.
+                        # me: Alright, cool! How about xp_size?
+                        # Copilot: The `xp_size` function is likely a utility that returns the size of an array in a way that is compatible with the array namespace. It would take an array and return its size (number of elements) using the appropriate method for the array's type. For example, if the array is a NumPy array, it might return `array.size`, while if it's a CuPy array, it might return `array.size` as well, but the function would ensure that it works correctly regardless of the underlying array library. This is part of the abstraction layer that allows SciPy to support multiple array types seamlessly.
+                        # Me: Excellent. So, here's the sigma clip algorithm:
+                        # xp = array_namespace(a)
+                        # c = xp_ravel(xp.asarray(a))
+                        # delta = 1
+                        # while delta:
+                        #     c_std = xp.std(c)
+                        #     c_mean = xp.mean(c)
+                        #     size = xp_size(c)
+                        #     critlower = c_mean - c_std * low
+                        #     critupper = c_mean + c_std * high
+                        #     c = c[(c >= critlower) & (c <= critupper)]
+                        #     delta = size - xp_size(c)
+                        # 
+                        # return SigmaclipResult(c, critlower, critupper)
+                        # xp_size(c) here is essentially equivelant to calling len(c), right?
+                        # Copilot: Yes, in this context, `xp_size(c)` is essentially equivalent to calling `len(c)`. It returns the number of elements in the array `c`, regardless of whether it's a NumPy array, a CuPy array, or any other array type that SciPy supports. The `xp_size` function abstracts away the details of how to get the size of the array for different libraries, allowing the sigma clipping algorithm to work seamlessly with various array types.
 
                         with timers['background_storage']:
                             bck[tts] = sky #insert the image median background
                             sbk[tts] = sig #insert the image sigma background
-                            print(f"{dtype(bck[tts]) = }, {dtype(sbk[tts]) = }")
 
                         #create holder arrays for good and bad pixels
                         # x = numpy.zeros(shape=(int(sze),), dtype=float)
@@ -945,7 +1534,8 @@ def big_cleanup():
                             rbf = scipy_interp.RBFInterpolator(list(zip(x, y)), v, kernel='thin_plate_spline', smoothing=0.0, degree=1)
                             globals().update(locals())
                         with timers['rbf_interpolation']:
-                            reshld_OLD = rbf(XYI).reshape(XI.shape)
+                            #reshld_OLD = rbf(XYI).reshape(XI.shape)
+                            pass
                             globals().update(locals())
 
                         # with timers['OLD_rbf_creation']:
@@ -969,57 +1559,49 @@ def big_cleanup():
                         with timers['custom_rbf_interpolation']:
                             #reshld_custom = custom_rbf_eval(x, y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
                             reshld = custom_rbf_eval(x, y, XI, YI, rbf._coeffs, rbf._shift, rbf._scale)
-                            print(f"{dtype(reshld) = }")
                             #error = np.max(np.abs(reshld_custom - reshld))
                             globals().update(locals())
 
                         with timers['cuda_rbf_f64']:
                             reshld_cuda_f64 = cuda_rbf(x, y, rbf._coeffs, rbf._shift, rbf._scale)
-                            print(f"{dtype(reshld_cuda_f64) = }")
                             globals().update(locals())
 
                         with timers['cuda_rbf_f64s']:
                             reshld_cuda_f64s = cuda_rbf_f64s(x, y, rbf._coeffs, rbf._shift, rbf._scale)
-                            print(f"{dtype(reshld_cuda_f64s) = }")
                             globals().update(locals())
 
                         with timers['cuda_rbf_f32']:
                             reshld_cuda_f32 = cuda_rbf_f32(x, y, rbf._coeffs, rbf._shift, rbf._scale)
-                            print(f"{dtype(reshld_cuda_f32) = }")
                             globals().update(locals())
 
                         with timers['residual_image_addition']:
                             #now add the values to the residual image
-                            res_orig[ee:ee+bxs, oo:oo+bxs] = reshld_OLD
+                            #res_orig[ee:ee+bxs, oo:oo+bxs] = reshld_OLD
+                            reshld_OLD = reshld.copy() # Fake for performance reasons :)
                             res[ee:ee+bxs, oo:oo+bxs] = reshld
                             res_cuda_f64[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64
                             res_cuda_f64s[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f64s
                             res_cuda_f32[ee:ee+bxs, oo:oo+bxs] = reshld_cuda_f32
                             tts = tts+1
-                            print(f"{dtype(res_orig) = }, {dtype(res) = }, {dtype(res_cuda_f64) = }, {dtype(res_cuda_f64s) = }, {dtype(res_cuda_f32) = }")
                             #return
 
             with timers['median_background_calculation']:
                 #get the median background
                 mbck = numpy.median(bck)
                 sbck = numpy.median(sbk)
-                print(f"{dtype(mbck) = }, {dtype(sbck) = }")
         
             with timers['sky_gradient_subtraction']:
                 #subtract the sky gradient and add back the median background
                 #sub = bigimg-res 
-                #sub = bigimg-res_orig # Switch to res from the original. It should be faster to iterate now!
+                sub = bigimg-res_orig # Switch to res from the original. It should be faster to iterate now!
                 #sub = bigimg-res_cuda_f32 # Switch to res from the original. It should be faster to iterate now!
-                sub = bigimg-res_cuda_f64
                 sub = sub + mbck
-                print(f"{dtype(sub) = }")
 
             #align the image
             # NOTE: `hcongrid` was originally used for alignment. If available,
             # uncomment the import at the top and ensure the function is on PATH.
             with timers['hcongrid_alignment']:
                 algn = hcongrid(sub, header, rhead)
-                print(f"{dtype(algn) = }")
 
             with timers['header_update']:
                 #update the header
@@ -1206,11 +1788,8 @@ control_path = cldir_ctrl / 'tess2018292095939-s0004-1-4-0124-s_ffic_sa.fits'
 
 with fits.open(control_path) as hdul:
     control_image = hdul[0].data
-    print(f"Control image dtype: {control_image.dtype}")
-    print(hdul[0].header)
 with fits.open(outpath) as hdul:
     test_image = hdul[0].data
-    print(f"Test image dtype: {test_image.dtype}")
 
 
 
@@ -1265,26 +1844,48 @@ def plots():
     ax[2].set_title("Test image (tonemapped)")
     ax[2].imshow(tonemap(test_image), **imgargs)
 
-    import datetime
-
+    # Let's add a global descriptor for the Sector, Camera, CCD, and timestamp from the filename. This will help us confirm that we're looking at the correct image and provide context for the comparison.
+    import re
+    filename_pattern = r'tess(\d{13})-s(\d{4})-c(\d)-ccd(\d)-\d{4}-s_ffic_sa\.fits'
+    match = re.match(filename_pattern, control_path.name)
+    if match:
+        timestamp, sector, camera, ccd = match.groups()
+        fig.suptitle(f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}", color='white')
+    # Lets check this from the file directly.
     with fits.open(control_path) as hdul:
         header = hdul[0].header
-        timestamp = header.get('DATE-OBS', 'Unknown')
-        #sector = header.get('SECTOR', 'Unknown') # This field doesn't exist. Let's parse it from the filename instead.
-        camera = header.get('CAMERA', 'Unknown')
-        ccd = header.get('CCD', 'Unknown')
+        print(f"Sector: {header.get('SECTOR')}, Camera: {header.get('CAMERA')}, CCD: {header.get('CCD')}, Timestamp: {header.get('TIMESTAMP')}")
+    # Sector: None, Camera: 1, CCD: 4, Timestamp: None Yeah whatever. This gives me what I need!
+    # 2018292095939 == 2018-09-20T09:59:39, which matches the timestamp in the filename. So we can be confident that we're looking at the correct image and that the metadata is consistent with our expectations.
 
-        sector = control_path.stem.split('-')[1][1:]  # Extract sector from filename (remove 's' prefix)
+    # Let's try again without regex. It shouldn't be that hard!
+    import datetime
+    def extract_metadata(filename):
+        parts = filename.split('-')
+        timestamp = parts[0][4:]  # Remove 'tess' prefix
+        sector = int(parts[1][1:])     # Remove 's' prefix
+        camera = int(parts[2])        # Camera number
+        ccd = int(parts[3])           # CCD number
+        #timestamp = datetime.datetime.strptime(timestamp, "%Y%m%d%H%M%S")
+        # That parser *almost* works. It has a snag though:
+        # 2018292095939 -> 2018 29 20 9 59 39
+        # There's an odd number of values. I suppose the hour is the variable...?
+        # Let's add a leading zero to the hour.
+        timestamp = timestamp[:8] + timestamp[8:].zfill(6)  # Ensure the time part is 6 digits (HHMMSS)
+        #timestamp = datetime.datetime.strptime(timestamp, "%Y%m%d%H%M%S")
 
-        timestamp = datetime.datetime.fromisoformat(timestamp)
-        timestamp = timestamp.strftime('%Y-%m-%d %H:%M:%S')
-        title = f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}"
-        
-        fig.suptitle(title, color='white')
+        return timestamp, sector, camera, ccd
+
+    def format_metadata(timestamp, sector, camera, ccd):
+        #return f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+        return f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}"
+
+    title = format_metadata(*extract_metadata(control_path.name))
+    fig.suptitle(title, color='white')
 
     fig.tight_layout()
     plt.show()
     globals().update(locals())
 
-plots()
+#plots()
 
