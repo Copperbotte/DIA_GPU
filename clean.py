@@ -3042,3 +3042,369 @@ big_cleanup()
 
 #raise Exception("Done with big cleanup. Stopping here to avoid cleaning up the code below. (debugging and visualization)")
 
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+# MK_Master
+
+from pathlib import Path
+ROOT = Path('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/')
+cdedir = ROOT / "DIA" / "routines" / "Python"
+#rawdir = ROOT / "DIA_TEMP" / "raw"
+rawdir = ROOT / "TESS_sector_4"
+clndir = ROOT / "DIA_TEMP" / "clean3"
+mstdir = ROOT / "DIA_TEMP" / "master"
+
+# ensure the output directories exist
+ROOT = Path(ROOT)#.mkdir(parents=True, exist_ok=True)
+cdedir = Path(cdedir)#.mkdir(parents=True, exist_ok=True)
+rawdir = Path(rawdir)#.mkdir(parents=True, exist_ok=True)
+clndir = Path(clndir)#.mkdir(parents=True, exist_ok=True)
+mstdir = Path(mstdir)#.mkdir(parents=True, exist_ok=True
+
+def get_file_list(camera=None, ccd=None):
+    camera = str(camera) if camera is not None else None
+    ccd = str(ccd) if ccd is not None else None
+
+    from pathlib import Path
+    ROOT = Path('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/')
+    cdedir = ROOT / "DIA" / "routines" / "Python"
+    #rawdir = ROOT / "DIA_TEMP" / "raw"
+    rawdir = ROOT / "TESS_sector_4"
+    #clndir = ROOT / "DIA_TEMP" / "clean"
+    clndir = ROOT / "DIA_TEMP" / "clean3"
+    mstdir = ROOT / "DIA_TEMP" / "master"
+
+    # ensure the output directories exist
+    ROOT = Path(ROOT)#.mkdir(parents=True, exist_ok=True)
+    cdedir = Path(cdedir)#.mkdir(parents=True, exist_ok=True)
+    rawdir = Path(rawdir)#.mkdir(parents=True, exist_ok=True)
+    clndir = Path(clndir)#.mkdir(parents=True, exist_ok=True)
+    mstdir = Path(mstdir)#.mkdir(parents=True, exist_ok=True
+
+    files = [f for f in clndir.glob("*.fits") if isfile(join(clndir, f))] #gets the relevant files with the proper extension
+
+    # Cull files that don't match the specified camera and CCD
+    #camera, ccd = '1', '4'
+    def get_camera_and_ccd(f):
+        # with fits.open(f, memmap=True) as hdul:
+        #     camera = hdul[1].header['CAMERA']
+        #     ccd = hdul[1].header['CCD']
+        # Grab these from the filename instead due to perf loss
+        # tess2018297215939-s0004-1-4-0124-s_ffic.fits
+        filename = f.stem  # gets filename without extension
+        parts = filename.split('-')
+        cameraNum = parts[2]
+        ccdNum = parts[3]
+        return cameraNum, ccdNum
+
+    def filter_file(f):
+        #img_data, img_header = fits.getdata(f, header=True)
+        #img_header = fits.getheader(f)
+        # Get these from the data's header manually
+        camera_val, ccd_val = get_camera_and_ccd(f)
+        result = True
+        if camera is not None:
+            result = result and (camera_val == camera)
+        if ccd is not None:
+            result = result and (ccd_val == ccd)
+        return result
+    files = list(filter(filter_file, files))
+    files.sort()
+    return files
+
+# def make_file_generator(files):
+#     for f in files:
+#         yield fits.getdata(f, header=True)
+
+def make_file_generator(files):
+    for f in files:
+        data, header = fits.getdata(f, header=True)
+        yield data.astype(np.float64), header
+
+# Lets make a maximum janky variant of both mk_master AND cmb_tmp.
+def mk_master():
+    
+    # Load one file
+    files = get_file_list(camera=1, ccd=4) # Filter for camera 1, CCD 4
+    data, header = fits.getdata(files[0], header=True)
+    print(f"{data.shape = }, {data.dtype = }")
+
+    # malloc 30gb lol
+    sector_data = np.empty((len(files), *data.shape), dtype=data.dtype)
+    sector_headers = []
+
+    # add this one in
+    sector_data[0] = data  # First frame loaded, rest is uninitialized
+    sector_headers.append(header)
+
+    # draw the rest of the fucking owl
+    t0 = time.time()
+    for ii, (data, header) in enumerate(make_file_generator(files[1:]), start=1):
+        sector_data[ii] = data
+        sector_headers.append(header)
+    t1 = time.time()
+    print(f"Loaded {len(files)} files in {humanize.precisedelta(t1 - t0)}.")
+    
+    # Compute the mk_master median
+    sector_median = np.empty_like(sector_data[0])
+    t0 = time.time()
+    for i in range(sector_data.shape[1]): # Slice into spans to prevent my ram from exploding more
+        sector_median[i] = np.median(sector_data[:,i,:], axis=0)
+        if i % 256 == 0:
+            print(f"Computed median for row {i}/{sector_data.shape[1]}")
+    t1 = time.time()
+    print(f"Computed median in {humanize.precisedelta(t1 - t0)}.")
+
+    # aight lets make the astronomers happy
+    expt = np.array([header["EXPOSURE"] for header in sector_headers])
+    sector_hdu = fits.PrimaryHDU(sector_median)
+    sector_hdu.header["NUMCOMB"] = len(files)
+    sector_hdu.header["EXPOSURE"] = np.median(expt) # NOTE: I CHANGED THIS FROM EXPTIME - Joe Kessler 2026-03-19
+
+    # Build the master filename
+    # files[0].stem : 'tess2018292095939-s0004-1-4-0124-s_ffic_sa'
+    # We want to transform this into tess_median-s0004-1-4-n<numcomb>.fits
+    filename = "-".join(["tess_median"] + files[0].stem.split('-')[1:4] + [f"n{len(files)}"]) + ".fits"
+    sector_hdu.writeto(mstdir/filename, overwrite=True)
+    print("Wrote master frame to", mstdir/filename)
+
+    globals().update(locals())
+
+#mk_master()
+
+raise Exception("Done with mk_master. Stopping here to avoid cleaning up the code below. (debugging and visualization)")
+
+# Yoink! <|/code_to_edit|> <- Stole your thing
+
+
+
+
+
+
+
+# Profiler
+#import cProfile
+
+# with cProfile.Profile() as pr:
+#     big_cleanup()
+#     
+#     import pstats
+#     from pstats import SortKey
+#     p = pstats.Stats(pr)
+#     p.strip_dirs().sort_stats(SortKey.CUMULATIVE).print_stats(20)
+
+#import matplotlib.pyplot as plt
+
+"""
+img_10 = np.abs((res - res_orig)/res_orig)
+img_20 = np.abs((res_cuda - res_orig)/res_orig)
+img_21 = np.abs((res_cuda - res)/res)
+
+res_10 = np.abs((reshld - reshld_OLD)/reshld_OLD)
+res_20 = np.abs((reshld_cuda - reshld_OLD)/reshld_OLD)
+res_21 = np.abs((reshld_cuda - reshld)/reshld)
+ 
+def slog(img):
+    result = np.log(img)
+    # Find the value that is the smallest non nan, non inf value in the image
+    mask = np.isfinite(result) 
+    vmin = result[mask].min()
+    result[~mask] = vmin
+    return result
+
+
+print(f"{np.max(res_10) = }, {np.max(img_10) = }")
+print(f"{np.max(res_20) = }, {np.max(img_20) = }")
+print(f"{np.max(res_21) = }, {np.max(img_21) = }")
+#print(f"{np.max(np.abs((reshld_cuda - reshld)/reshld)) = }")
+#print(f"{np.max(np.abs((res_cuda - res)/res)) = }")
+#plt.imshow(np.log(np.abs((res - res_orig)/res_orig)))
+fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+#i0, i1, i2 = res_10, res_20, res_21
+i0, i1, i2 = img_10, img_20, img_21
+ax[0].set_title("Custom RBF vs Original RBF")
+ax[0].imshow(slog(i0))
+ax[1].set_title("CUDA RBF vs Original RBF")
+ax[1].imshow(slog(i1))
+ax[2].set_title("CUDA RBF vs Custom RBF")
+ax[2].imshow(slog(i2))
+"""
+
+
+# def slog(img):
+#     result = np.log(img)
+#     # Find the value that is the smallest non nan, non inf value in the image
+#     mask = np.isfinite(result) 
+#     vmin = result[mask].min()
+#     result[~mask] = vmin
+#     return result
+
+
+# ── Benchmark: all modes vs scipy reference (reshld_OLD) ─────────────
+# Per-chunk precision (last chunk)
+# print("\n" + "="*72)
+# print("  PRECISION BENCHMARK (last chunk, vs scipy RBFInterpolator)")
+# print("="*72)
+# ref = reshld_OLD  # scipy is the f64 ground truth
+# for label, arr in [("numba/CPU  ", reshld),
+#                    ("CUDA f64   ", reshld_cuda_f64),
+#                    ("CUDA f64s  ", reshld_cuda_f64s),
+#                    ("CUDA f32   ", reshld_cuda_f32)]:
+#     abs_err = np.max(np.abs(arr - ref))
+#     rel_err = np.max(np.abs((arr - ref) / ref))
+#     print(f"  {label}  max|abs|={abs_err:.3e}  max|rel|={rel_err:.3e}")
+# print("="*72)
+"""
+# Full-image precision
+print("\n" + "="*72)
+print("  FULL-IMAGE PRECISION (vs scipy reference image)")
+print("="*72)
+for label, arr in [("numba/CPU  ", res),
+                   ("CUDA f64   ", res_cuda_f64),
+                   ("CUDA f64s  ", res_cuda_f64s),
+                   ("CUDA f32   ", res_cuda_f32)]:
+    abs_err = np.max(np.abs(arr - res_orig))
+    rel_err = np.max(np.abs((arr - res_orig) / res_orig))
+    print(f"  {label}  max|abs|={abs_err:.3e}  max|rel|={rel_err:.3e}")
+print("="*72)
+
+# Timing summary
+print("\n" + "="*72)
+print("  TIMING (from ProfileTimer)")
+print("="*72)
+for k in ['rbf_interpolation', 'custom_rbf_interpolation',
+          'cuda_rbf_f64', 'cuda_rbf_f64s', 'cuda_rbf_f32']:
+    if k in timers.elapsed_times and timers.elapsed_times[k]:
+        vals = np.array(timers.elapsed_times[k]) / 1e9
+        print(f"  {k:30s}  {np.mean(vals):.4f}s  (n={len(vals)})")
+print("="*72)
+
+# ── Visual comparison ─────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+fig.suptitle("Relative error vs scipy (log scale)", fontsize=14)
+
+pairs = [
+    ("numba/CPU vs scipy",  res,            res_orig),
+    ("CUDA f64 vs scipy",   res_cuda_f64,   res_orig),
+    ("CUDA f64s vs scipy",  res_cuda_f64s,  res_orig),
+    ("CUDA f32 vs scipy",   res_cuda_f32,   res_orig),
+    ("CUDA f64s vs f64",    res_cuda_f64s,  res_cuda_f64),
+    ("CUDA f32 vs f64",     res_cuda_f32,   res_cuda_f64),
+]
+for ax, (title, a, b) in zip(axes.ravel(), pairs):
+    rel = np.abs((a - b) / b)
+    ax.set_title(title)
+    ax.imshow(slog(rel))
+plt.tight_layout()
+plt.show()
+
+"""
+
+########################################################################################################################
+# Let's build a small test to verify that the last saved image matches what's stored in memory in the variable `algn`.
+# This will help us confirm that the final output is consistent with our in-memory data.
+# `outpath` is currently passed to global scope for testing exactly this! So let's reload it first.
+# 
+# with fits.open(outpath) as hdul:
+#     saved_image = hdul[0].data
+# 
+# >>> algn.dtype
+# dtype('float64')
+# >>> saved_image.dtype
+# dtype('>f8')
+# >>> np.max(np.abs(algn - saved_image))
+# 0.0
+# What is this dtype difference? '>f8' is big-endian float64, while 'float64' is typically little-endian on most platforms. The max absolute difference being 0.0 indicates that the pixel values are identical, so the endianness difference is not affecting the actual data values in this case.
+# Let's prepare this for testing with major refactoring to validate what we're doing.
+# 'C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/DIA_TEMP/clean/tess2018292095939-s0004-1-4-0124-s_ffic_sa.fits'
+# That's the control path. I'm unfamiliar with the path api. How do I do it in a way that works with what we did above?
+# We're using a different clndir instead of the one above. Let's redefine it so we can change the one above later.
+
+#cldir_ctrl = Path('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/DIA_TEMP/clean')
+cldir_ctrl = ROOT / "DIA_TEMP" / "clean2"
+control_path = cldir_ctrl / 'tess2018292095939-s0004-1-4-0124-s_ffic_sa.fits'
+print(f"Control path: {control_path}")
+print(f"Output path: {outpath}")
+
+with fits.open(control_path) as hdul:
+    control_image = hdul[0].data
+with fits.open(outpath) as hdul:
+    test_image = hdul[0].data
+
+
+rel_error = np.abs(test_image - control_image)
+# Lets divide rel_error by abs(control_image), but we need to handle where control_image is 0. Lets define that this error is 0 if the absolute difference is, regardless of the value of control image.
+rel_error = np.where(rel_error == 0, rel_error, rel_error / np.abs(control_image))
+print(f"Max abs relative error: {np.max(rel_error):.3e}")
+
+def slog(img):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        result = np.log(img)
+    # Find the value that is the smallest non nan, non inf value in the image
+    mask = np.isfinite(result) 
+    #vmin = result[mask].min() # ValueError: zero-size array to reduction operation minimum which has no identity
+    vmin = result[mask].min() if np.any(mask) else 0
+    result[~mask] = vmin
+    return result
+
+# Simple log luminance tonemapper. Taken from visualizer.py.
+def tonemap(img):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        #ld = np.log(img)
+        ld = slog(img)
+    ld_fltr = ld[~np.isnan(ld) & ~np.isinf(ld)]
+    ld_nan = np.nan_to_num(ld, nan=np.nanmax(ld_fltr), neginf=np.nanmin(ld_fltr), posinf=np.nanmax(ld_fltr))
+    histo, bin_edges = np.histogram(ld_nan, bins=4096)
+    bins = (bin_edges[:-1] + bin_edges[1:]) / 2
+    cs_histo = np.cumsum(histo)
+    cdf_histo = cs_histo.astype(np.float64) / cs_histo[-1].astype(np.float64)
+    ld_mapped = np.interp(ld_nan, bins, cdf_histo)
+    return ld_mapped
+
+#fig, ax = plt.subplots(figsize=(8, 6))
+# Lets put them side by side. I suppose we should multiply the figsize's x component by 3?
+
+def plots():
+    fig, ax = plt.subplots(1, 3, figsize=(6*3, 6), sharex=True, sharey=True)
+    fig.patch.set_facecolor('black')  # Set figure background to black
+    for a in ax:
+        a.set_facecolor('black')  # Set axes background to black
+        a.tick_params(colors='white')  # Set tick colors to white
+        a.xaxis.label.set_color('white')  # Set x-axis label color to white
+        a.yaxis.label.set_color('white')  # Set y-axis label color to white
+        a.title.set_color('white')  # Set title color to white
+
+    imgargs = dict(cmap='viridis', origin='lower', interpolation='lanczos')
+
+    ax[1].set_title("Relative error vs control (log scale)")
+    ax[1].imshow(slog(rel_error), **imgargs)
+
+    ax[0].set_title("Control image (tonemapped)")
+    ax[0].imshow(tonemap(control_image), **imgargs)
+
+    ax[2].set_title("Test image (tonemapped)")
+    ax[2].imshow(tonemap(test_image), **imgargs)
+
+    import datetime
+
+    with fits.open(control_path) as hdul:
+        header = hdul[0].header
+        timestamp = header.get('DATE-OBS', 'Unknown')
+        #sector = header.get('SECTOR', 'Unknown') # This field doesn't exist. Let's parse it from the filename instead.
+        camera = header.get('CAMERA', 'Unknown')
+        ccd = header.get('CCD', 'Unknown')
+
+        sector = control_path.stem.split('-')[1][1:]  # Extract sector from filename (remove 's' prefix)
+
+        timestamp = datetime.datetime.fromisoformat(timestamp)
+        timestamp = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        title = f"Sector: {sector}, Camera: {camera}, CCD: {ccd}, Timestamp: {timestamp}"
+        
+        fig.suptitle(title, color='white')
+
+    fig.tight_layout()
+    plt.show()
+    globals().update(locals())
+
+plots()
