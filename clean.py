@@ -63,6 +63,35 @@ cdedir = Path(cdedir)#.mkdir(parents=True, exist_ok=True)
 rawdir = Path(rawdir)#.mkdir(parents=True, exist_ok=True)
 clndir = Path(clndir)#.mkdir(parents=True, exist_ok=True)
 
+if False:
+    file = 'tess2018292095939-s0004-1-4-0124'
+
+
+    def print_header_if_matching(folder, file):
+        files_ = [f for f in folder.glob("*.fits") if isfile(join(folder, f))]
+        ref_, head_ = fits.getdata(os.path.join(folder, files_[0]), header = True)
+        print(f"Header for {folder / files_[0]}:")
+        print(head_.tostring('\n'))
+        print('#'*80)
+        print('#'*80)
+        print('#'*80)
+        globals().update(locals())
+
+
+
+
+    #with fits.open('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/TESS_sector_4/tess2018292095939-s0004-1-4-0124-s_ffic.fits') as hdul:
+    #    print('raw:', hdul[0].header['DQUALITY'])
+
+    print_header_if_matching(rawdir, file)
+    print_header_if_matching(ROOT / "DIA_TEMP" / "clean2", file)
+    print_header_if_matching(ROOT / "DIA_TEMP" / "clean3", file)
+
+
+    raise Exception
+
+
+#sample every how many pixels? usually 32x32 is OK but it can be larger or smaller
 pix = 32 # UPDATE HERE FOR BACKGROUND SPACING
 axs = 2048 # UPDATE HERE FOR IMAGE AXIS SIZE
 ###END UPDATE INFORMATION###
@@ -104,6 +133,7 @@ rhead['CRPIX1'] = 1001.
 rhead['NAXIS1'] = 2048
 rhead['NAXIS2'] = 2048
 
+#sample every how many pixels?
 bxs = 512 #how big do you want to make the boxes for each image?
 #bxs = axs # Do nothing #WARNING: O(n^3) 
 #bxs = 1024
@@ -125,6 +155,7 @@ if (biassub == 1):
 
 
 from time import time_ns
+import humanize
 # Usage: Create a TimerGroup with a set of keys.
 # Then for each key, we call 'from timer_group with key'. Is that valid syntax?
 # Can I instead do with timer_group['key'] and have it persist state?
@@ -172,7 +203,8 @@ class ProfileTimer:
 
     def get_elapsed_times(self):
         secs = {key: np.array(elapsed) / 1e9 for key, elapsed in self.elapsed_times.items()}  # Convert nanoseconds to seconds
-        return {key: [np.mean(elapsed), np.std(elapsed), len(elapsed)] for key, elapsed in secs.items()}  # Return average time for each key
+        return {key: [np.mean(elapsed[0:]), np.std(elapsed[0:]), len(elapsed)] for key, elapsed in secs.items()}  # Return average time for each key
+        #return {key: [np.mean(elapsed[1:]), np.std(elapsed[1:]), len(elapsed)-1] for key, elapsed in secs.items()}  # Return average time for each key
     
     def __str__(self):
         elapsed_times = self.get_elapsed_times()
@@ -181,7 +213,7 @@ class ProfileTimer:
         params = []
         for key in keys:
             val, std, count = elapsed_times[key]
-            params.append([f'{key}', f'{val:.6f}', f'{std:.6f}', f'{count}', f'{val*count:.6f}'])
+            params.append([f'{key}', f'{val:.6f}', f'{std:.6f}', f'{count}', f'{val*count:.6f}', f'{humanize.metric(1/val, "Hz")}'])
 
         # align by specific directions for readability
         #param_max_lengths = list(map(lambda col: max(len(col)), zip(*params)))
@@ -195,8 +227,10 @@ class ProfileTimer:
             params[n][2] = params[n][2].ljust(param_max_lengths[2])
             params[n][3] = params[n][3].rjust(param_max_lengths[3])
             params[n][4] = params[n][4].rjust(param_max_lengths[4])
+            params[n][5] = params[n][5].rjust(param_max_lengths[5])
 
-        return '\n'.join(f'{param[0]}: {param[1]} ± {param[2]} seconds for n={param[3]} in {param[4]} seconds' for param in params)
+        #return '\n'.join(f'{param[0]}: {param[1]} ± {param[2]} seconds for n={param[3]} in {param[4]} seconds' for param in params)
+        return '\n'.join(f'{param[0]}: ({param[5]}) : {param[1]} ± {param[2]} seconds for n={param[3]} in {param[4]} seconds' for param in params)
         #return '\n'.join(f'{key}: {elapsed[0]:.6f} ± {elapsed[1]:.6f} seconds for n={elapsed[2]} in {elapsed[0]*elapsed[2]:.6f} seconds' for key, elapsed in elapsed_times.items())
 
 #@numba.njit #(parallel=True) # Parallel seems to perform worse.
@@ -1256,10 +1290,88 @@ class CUDASigmaClipBatched:
         return mask_bool, self.h_ccnt.copy(), los, his
 
 
+
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+
+# Custom hcongrid evaluation
+
+# def hcongrid(image, header1, header2, preserve_bad_pixels=True, **kwargs):
+#     """
+#     Interpolate an image from one FITS header onto another
+# 
+#     kwargs will be passed to `~scipy.ndimage.interpolation.map_coordinates`
+# 
+#     Parameters
+#     ----------
+#     image : `~numpy.ndarray`
+#         A two-dimensional image
+#     header1 : `~astropy.io.fits.Header` or `~astropy.wcs.WCS`
+#         The header or WCS corresponding to the image
+#     header2 : `~astropy.io.fits.Header` or `~astropy.wcs.WCS`
+#         The header or WCS to interpolate onto
+#     preserve_bad_pixels : bool
+#         Try to set NAN pixels to NAN in the zoomed image.  Otherwise, bad
+#         pixels will be set to zero
+# 
+#     Returns
+#     -------
+#     newimage : `~numpy.ndarray`
+#         ndarray with shape defined by header2's naxis1/naxis2
+# 
+#     Raises
+#     ------
+#     TypeError if either is not a Header or WCS instance
+#     Exception if image1's shape doesn't match header1's naxis1/naxis2
+# 
+#     Examples
+#     --------
+#     >>> fits1 = pyfits.open('test.fits')
+#     >>> target_header = pyfits.getheader('test2.fits')
+#     >>> new_image = hcongrid(fits1[0].data, fits1[0].header, target_header)
+# 
+#     """
+# 
+#     _check_header_matches_image(image, header1)
+# 
+#     grid1 = get_pixel_mapping(header1, header2)
+# 
+#     bad_pixels = np.isnan(image) + np.isinf(image)
+# 
+#     image[bad_pixels] = 0
+# 
+#     newimage = scipy.ndimage.map_coordinates(image, grid1, **kwargs)
+# 
+#     if preserve_bad_pixels:
+#         newbad = scipy.ndimage.map_coordinates(bad_pixels, grid1, order=0,
+#                                                mode='constant',
+#                                                cval=np.nan)
+#         newimage[newbad] = np.nan
+# 
+#     return newimage
+
+
+
+
+
+
+
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+
+
+
+
+
 def big_cleanup():
-    # Pre-allocate output buffers outside the per-frame loop to avoid
-    # repeated allocation/deallocation ("thrashing").  These are reused
-    # for every frame — just .fill(0) at the start of each iteration.
+    # prevent memory thrashing by preallocating arrays for the background and sigma
+    # Is thrashing the right term here? A better term might be "overhead from repeated allocations" or "performance degradation from dynamic memory management"
     res = np.empty(shape=(axs, axs), dtype=float) #holder for the background 'image'
     res_orig = np.empty_like(res, dtype=float) # separate output buffer for the original RBF, for comparison
     res_cuda_f64 = np.empty_like(res, dtype=np.float64) # was f32, truncating the f64 output from evaluate()
@@ -1371,10 +1483,12 @@ def big_cleanup():
                 sbk.fill(0.0)
 
             with timers['flat_and_bias_subtraction']:
+                #remove the flat and the bias
                 if (biassub == 1) and (flatdiv == 1):
-                    bigimg = bigimg - bias
-                    bigimg = bigimg/flat
+                    bigimg = bigimg - bias #subtract the bias
+                    bigimg = bigimg/flat #subtract the flat
 
+            #with timers['total_background_subtraction_chunking']:
             with timers['total_background_sigma_clipping']:
                 tts = 0
                 for oo in range(0, axs, bxs): # Chunks of the image in the x direction
@@ -1419,15 +1533,18 @@ def big_cleanup():
                             tts += 1
 
             with timers['median_background_calculation']:
+                #get the median background
                 mbck = np.median(bck)
                 sbck = np.median(sbk)
+            
+            overlap = np.zeros_like(bigimg).astype(int)
 
             with timers['total_background_subtraction_chunking']:
                 for oo in range(0, axs, bxs): # Chunks of the image in the x direction
                     for ee in range(0, axs, bxs): # Chunks of the image in the y direction
                         print(f"{axs = }, {bxs = }, {oo = }, {ee = }")
                         img = bigimg[ee:ee+bxs, oo:oo+bxs]
-                        sig = sbk[oo//bxs, ee//bxs] #get the sigma for this chunk # retrieve this chunk's σ from pass 1
+                        sig = sbk[oo//bxs, ee//bxs] #get the sigma for this chunk
 
                         #create holder arrays for good and bad pixels
                         # x = np.zeros(shape=(int(sze),), dtype=float)
@@ -1440,25 +1557,53 @@ def big_cleanup():
                             v.fill(0.0)
                             s.fill(0.0)
                         nd = 0
-            
+
+                        # Subdivide the chunks further into smaller boxes for local sky estimation, to capture any local variations in the background. The size of these boxes is determined by the 'lop' variable, which defines the half-size of the box (i.e., the box will be (2*lop) x (2*lop) pixels). We will sample the local sky value at the center of each box, and then use these sampled values to interpolate a smooth background across the entire chunk.
+                        #begin the sampling of the "local" sky value
                         with timers['local_sky_sampling']:
                             for jj in range(0, bxs+pix, pix):
                                 for kk in range(0,bxs+pix, pix):
+                                    #print(f"Sampling local sky at pixel ({jj}, {kk}) in chunk ({oo}, {ee})")
                                     il = np.amax([jj-lop,0])
                                     ih = np.amin([jj+lop, bxs-1])
                                     jl = np.amax([kk-lop, 0])
                                     jh = np.amin([kk+lop, bxs-1])
                                     c = img[jl:jh, il:ih]
+
+                                    #overlap[ee+jl:ee+jh, oo+il:oo+ih] += 1 #keep track of how many times each pixel is sampled for the local sky estimation, for debugging purposes
+                                    #overlap[ee+jj:ee+jj+lop*2, oo+kk:oo+kk+lop*2] += 1 #keep track of how many times each pixel is sampled for the local sky estimation, for debugging purposes
+                                    # Lets use the bound lower, unbound upper
+                                    overlap[jl:kk+lop, il:jj+lop] += 1 #keep track of how many times each pixel is sampled for the local sky estimation, for debugging purposes
+
                                     #select the median value with clipping
                                     cc, cclow, cchigh = scipy.stats.sigmaclip(c, low=2.5, high = 2.5) #sigma clip the background
                                     lsky = np.median(cc) #the sky background
                                     ssky = np.std(cc) #sigma of the sky background
+                                    #print(f"Local sky at pixel ({jj}, {kk}) in chunk ({oo}, {ee}): {lsky = }, {ssky = }")
+                                    msg = ""
+                                    msg += f"In chunk ({oo}, {ee}), sampling local sky at pixel ({jj}, {kk})"
+                                    msg += f" In band [{jl}:{jh}, {il}:{ih}]"
+                                    msg += f", got {len(c.flatten())} pixels, {len(cc.flatten())} after sigmaclip"
+                                    msg += f", local sky = {lsky:.2f}, local sigma = {ssky:.2f}" 
+                                    #print(msg)
                                     x[nd] = np.amin([jj, bxs-1]) #determine the pixel to input
                                     y[nd] = np.amin([kk, bxs-1]) #determine the pixel to input
                                     v[nd] = lsky #median sky
                                     s[nd] = ssky #sigma sky
                                     nd = nd + 1
+                                    if nd == -1:
+                                        overlap[ee+jl:ee+jh, oo+il:oo+ih] += 1 #keep track of how many times each pixel is sampled for the local sky estimation, for debugging purposes
 
+                                        globals().update(locals())
+                                        raise Exception("Debug")
+                        print(f"Sampled {nd} local sky values in chunk ({oo}, {ee})")
+                        # import matplotlib.pyplot as plt
+                        # plt.imshow(overlap, origin='lower')
+                        # plt.show()
+                        # globals().update(locals())
+                        # raise Exception("Debug")
+
+                        #now we want to remove any possible values which have bad sky values
                         with timers['bad_sky_removal']:
                             rj = np.where(v <= 0) #stuff to remove
                             kp = np.where(v > 0) #stuff to keep
@@ -1488,6 +1633,7 @@ def big_cleanup():
                                     v[idx] = ave
 
                         with timers['bad_sky_removal_interpolation_bad_sigmas']:
+                            #now we want to remove any possible values which have bad sigmas
                             rjs = np.where(s >= 2*sig)
                             rj  = rjs[0]
                             kps = np.where(s < 2*sig)
@@ -1516,6 +1662,10 @@ def big_cleanup():
                                     #insert the good value into the array
                                     v[idx] = ave
 
+                        #now we interpolate to the rest of the image with a thin-plate spline    
+                        #xi = np.linspace(0, bxs-1, bxs)
+                        #yi = np.linspace(0, bxs-1, bxs)
+                        #XI, YI = np.meshgrid(xi, yi)
                         with timers['rbf_creation']:
                             #rbf = Rbf(x, y, v, function = 'thin-plate', smooth = 0.0)
                             rbf = scipy_interp.RBFInterpolator(list(zip(x, y)), v, kernel='thin_plate_spline', smoothing=0.0, degree=1)
@@ -1570,15 +1720,23 @@ def big_cleanup():
                             res_cuda_f32[ee:ee+bxs, oo:oo+bxs]  = reshld_cuda_f32
                             #tts = tts+1
                             #return
+
+
         
             with timers['sky_gradient_subtraction']:
+                #subtract the sky gradient and add back the median background
+                #sub = bigimg-res_orig
                 sub = bigimg-res 
                 #sub = bigimg-res_cuda_f32 # Switch to res from the original. It should be faster to iterate now!
                 #sub = bigimg-res_cuda_f64
                 sub = sub + mbck
-                
+
+            #align the image
+            # NOTE: `hcongrid` was originally used for alignment. If available,
+            # uncomment the import at the top and ensure the function is on PATH.
             with timers['hcongrid_alignment']:
-                algn = hcongrid(sub, header, rhead)
+                algn = hcongrid(sub, header, rhead) # Do I even need this? Its mapping nothing.
+                #algn = sub.copy() # Placeholder for alignment step; always a no-op?
 
             with timers['header_update']:
                 #update the header
