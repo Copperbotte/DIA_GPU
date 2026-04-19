@@ -153,7 +153,8 @@ class ProfileTimer:
 
     def get_elapsed_times(self):
         secs = {key: np.array(elapsed) / 1e9 for key, elapsed in self.elapsed_times.items()}  # Convert nanoseconds to seconds
-        return {key: [np.mean(elapsed[1:]), np.std(elapsed[1:]), len(elapsed)-1] for key, elapsed in secs.items()}  # Return average time for each key
+        return {key: [np.mean(elapsed[0:]), np.std(elapsed[0:]), len(elapsed)] for key, elapsed in secs.items()}  # Return average time for each key
+        #return {key: [np.mean(elapsed[1:]), np.std(elapsed[1:]), len(elapsed)-1] for key, elapsed in secs.items()}  # Return average time for each key
     
     def __str__(self):
         elapsed_times = self.get_elapsed_times()
@@ -179,7 +180,7 @@ class ProfileTimer:
             params[n][5] = params[n][5].rjust(param_max_lengths[5])
 
         #return '\n'.join(f'{param[0]}: {param[1]} ± {param[2]} seconds for n={param[3]} in {param[4]} seconds' for param in params)
-        return '\n'.join(f'{param[0]}: {param[1]} ± {param[2]} seconds ({param[5]}) for n={param[3]} in {param[4]} seconds' for param in params)
+        return '\n'.join(f'{param[0]}: ({param[5]}) : {param[1]} ± {param[2]} seconds for n={param[3]} in {param[4]} seconds' for param in params)
         #return '\n'.join(f'{key}: {elapsed[0]:.6f} ± {elapsed[1]:.6f} seconds for n={elapsed[2]} in {elapsed[0]*elapsed[2]:.6f} seconds' for key, elapsed in elapsed_times.items())
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -187,6 +188,9 @@ class ProfileTimer:
 # ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 def get_file_list(camera=None, ccd=None):
+    camera = str(camera) if camera is not None else None
+    ccd = str(ccd) if ccd is not None else None
+
     from pathlib import Path
     ROOT = Path('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/')
     cdedir = ROOT / "DIA" / "routines" / "Python"
@@ -1011,56 +1015,56 @@ void vec2_distort_sip_inv_newton_cuda_f64(
     result[1] = vb[1];
 }
 
-__constant__ double ref_px_coord_i[2];
-__constant__ double cd_ij[4];
-__constant__ double cd_inv_ij[4];
-__constant__ double Rotation_ij[9]; // This is the R_ij matrix in the code above. Its a View matrix!
-__constant__ double fwd_AB[2 * 25]; // 2 channels, 25 coefficients each for the 5th order polynomial (i+j<=4)
-__constant__ double inv_AB[2 * 25]; // 2 channels, 25 coefficients each for the 5th order polynomial (i+j<=4)
-__constant__ int N_pts;
+struct __align__(8) TESS_Mapping_Struct {
+    int    img_shape[2];       // 8 bytes
+    double ref_px_coord[2];    // 16 bytes
+    double cd[4];              // 32 bytes
+    double cd_inv[4];          // 32 bytes
+    double Rotation[9];        // 72 bytes
+    double fwd_AB[50];         // 400 bytes
+    double inv_AB[50];         // 400 bytes
+}; // Total: 8 + 16 + 32 + 32 + 72 + 400 + 400 = 960 bytes, which is less than the 48KB limit for constant memory on most GPUs.
 
-__constant__ int img_shape[2]; // height, width (same as numpy)
+__constant__ TESS_Mapping_Struct dst_data; // Reference image. We set this once!
+__constant__ TESS_Mapping_Struct src_data; // This is set for each image we upload. We could get away with just one struct and copying it each time, but this way we can have both the src and dst parameters available to the kernels at the same time without needing to copy between them.
+// It may be worth it to do this in batches of 50 for a later step, but I suspect that's not necessary due to the hardware compute bottleneck.
 
-__global__
-void distort_sip_cuda_f64(double* distort, double* vb) {
-    //int idx = threadIdx.x + blockDim.x * blockIdx.x;
-    //if (idx >= N) return;
-    DEF_IDX(N_pts, 1) // int idx is defined here! // DEF_IDX(width, height)
-
-    vec2_distort_sip_cuda_f64(&distort[idx*2], &vb[idx*2], fwd_AB); 
-}
-
-__global__
-void distort_sip_inv_newton_cuda_f64(
-    double* __restrict__ result,
-    double* __restrict__ out_ni
-) {
-    int idx = threadIdx.x + blockDim.x * blockIdx.x;
-    if (idx >= N_pts) return;
-    
-    vec2_distort_sip_inv_newton_cuda_f64(&result[idx*2], &out_ni[idx*2], fwd_AB, inv_AB);
-}
+// For the time being, lets replace each of these with calls to src for __globals__ that aren't used in hcongrid.
+// __constant__ double ref_px_coord_i[2];
+// __constant__ double cd_ij[4];
+// __constant__ double cd_inv_ij[4];
+// __constant__ double Rotation_ij[9]; // This is the R_ij matrix in the code above. Its a View matrix!
+// __constant__ double fwd_AB[2 * 25]; // 2 channels, 25 coefficients each for the 5th order polynomial (i+j<=4)
+// __constant__ double inv_AB[2 * 25]; // 2 channels, 25 coefficients each for the 5th order polynomial (i+j<=4)
+// __constant__ int N_pts;
+// 
+// __constant__ int img_shape[2]; // height, width (same as numpy)
 
 __device__
 void ICRS_from_TESS_cuda_f64(
     double* __restrict__ icrs_xyz, // double[3]
-    double* __restrict__ src_pixel // double[2]
+    double* __restrict__ src_pixel, // double[2]
+    TESS_Mapping_Struct* src
 ){
     // Center at the middle of the pixel grid. This is in [0, N-1] coordinates.
     double uv[2];
     for(int i=0; i<2; i++)
-        uv[i] = src_pixel[i] - (ref_px_coord_i[i] - 1);
+        uv[i] = src_pixel[i] - (src->ref_px_coord[i] - 1);
     
     double distort[2];
-    vec2_distort_sip_cuda_f64(distort, uv, fwd_AB);
+    vec2_distort_sip_cuda_f64(distort, uv, src->fwd_AB);
 
     double xyz[3];
     for(int i=0; i<2; i++)
         xyz[i] = 0.0;
 
+    // It turns out hcongrid doesn't do this. Its a bug in their code, not mine.
+    // What the fuck?
+    // for(int i=0; i<2; i++)
+    //     for(int j=0; j<2; j++)
+    //         xyz[i] += src->cd[i*2 + j] * (uv[j] + distort[j]);
     for(int i=0; i<2; i++)
-        for(int j=0; j<2; j++)
-            xyz[i] += cd_ij[i*2 + j] * (uv[j] + distort[j]);
+        xyz[i] = uv[i] + distort[i];
 
     const double PI = 3.1415926535897932384626433832795;
     xyz[2] = 180.0 / PI;
@@ -1071,27 +1075,17 @@ void ICRS_from_TESS_cuda_f64(
 
     for(int i=0; i<3; i++)
         for(int j=0; j<3; j++)
-            tmp[i] += Rotation_ij[i*3 + j] * xyz[j];
+            tmp[i] += src->Rotation[i*3 + j] * xyz[j];
 
     for(int i=0; i<3; i++)
         icrs_xyz[i] = tmp[i];
 }
 
-__global__
-void wcs_map_ICRS_from_TESS_cuda_f64(
-    double* __restrict__ icrs_xyz_ni,
-    double* __restrict__ src_pixel_ni
-){
-    int idx = threadIdx.x + blockDim.x * blockIdx.x;
-    if (idx >= N_pts) return;
-
-    ICRS_from_TESS_cuda_f64(&icrs_xyz_ni[idx*3], &src_pixel_ni[idx*2]);
-}
-
 __device__
 void TESS_from_ICRS_cuda_f64(
     double* __restrict__ dst_pixel, // double[2]
-    double* __restrict__ icrs_xyz // double[3]
+    double* __restrict__ icrs_xyz, // double[3]
+    TESS_Mapping_Struct* dst
 ){
     const double PI = 3.1415926535897932384626433832795;
 
@@ -1100,35 +1094,35 @@ void TESS_from_ICRS_cuda_f64(
         xyz[i] = 0.0;
     for(int i=0; i<3; i++)
         for(int j=0; j<3; j++)
-            xyz[i] += Rotation_ij[j*3 + i] * icrs_xyz[j]; // Transposed!
+            xyz[i] += dst->Rotation[j*3 + i] * icrs_xyz[j]; // Transposed!
 
     // Projection!
     for(int i=0; i<2; i++)
         xyz[i] *= (180.0 / PI) / xyz[2];
     
-    double uv[2];
-    for(int i=0; i<2; i++)
-        uv[i] = 0.0;
-    for(int i=0; i<2; i++)
-        for(int j=0; j<2; j++)
-            uv[i] += cd_inv_ij[i*2 + j] * xyz[j];
+    // It turns out hcongrid doesn't do this. Its a bug in their code, not mine.
+    // What the fuck?
+    // double uv[2];
+    // for(int i=0; i<2; i++)
+    //     uv[i] = 0.0;
+    // for(int i=0; i<2; i++)
+    //     for(int j=0; j<2; j++)
+    //         uv[i] += dst->cd_inv[i*2 + j] * xyz[j];
+    double uv[2] = {xyz[0], xyz[1]};
 
     double distort[2];
-    vec2_distort_sip_inv_newton_cuda_f64(distort, uv, fwd_AB, inv_AB);
-
+    vec2_distort_sip_inv_newton_cuda_f64(distort, uv, dst->fwd_AB, dst->inv_AB);
+    // 
     for(int i=0; i<2; i++)
-        dst_pixel[i] = distort[i] + (ref_px_coord_i[i] - 1);
-}
+        dst_pixel[i] = distort[i] + (dst->ref_px_coord[i] - 1);
 
-__global__
-void wcs_map_TESS_from_ICRS_cuda_f64(
-    double* __restrict__ dst_pixel_ni,
-    double* __restrict__ icrs_xyz_ni
-){
-    int idx = threadIdx.x + blockDim.x * blockIdx.x;
-    if (idx >= N_pts) return;
+    // double distort[2];
+    // vec2_distort_sip_cuda_f64(distort, uv, dst->inv_AB);
+    // //
+    // for(int i=0; i<2; i++)
+    //     dst_pixel[i] = uv[i] + distort[i] + (dst->ref_px_coord[i] - 1);
 
-    TESS_from_ICRS_cuda_f64(&dst_pixel_ni[idx*2], &icrs_xyz_ni[idx*3]);
+
 }
 
 __device__ __forceinline__
@@ -1308,26 +1302,152 @@ double texture_catmull_rom(
     return val;
 }
 
-__global__ // I dont think I'm going to test this :)
-void texture_resample_f64(
-    double* __restrict__ dst_img,
-    double* __restrict__ src_img,
-    double* __restrict__ src_coords, // [N_pts, 2]
-    int dst_h, 
-    int dst_w
-){
-    int idx;
-    if(mapidx(&idx, dst_w, dst_h)) return; // Map 2D thread/block indices to a 1D index, return if out of bounds
-    // idx is now bounded and has the right index!
+// ═══════════════════════════════════════════════════════════════════
+//  IIR B-spline prefilter (cubic, order=3)
+//  Converts raw samples → B-spline coefficients IN-PLACE.
+//  
+//  Run twice: once for rows (stride=1), once for columns (stride=w).
+//  Each thread handles one independent row or column.
+//  
+//  Matches scipy.ndimage._interpolation.spline_filter with
+//  mode='constant' (implicit zeros outside boundary → mirror BC
+//  for the IIR is what scipy actually does internally).
+// ═══════════════════════════════════════════════════════════════════
 
-    //int x = idx % dst_w;
-    //int y = idx / dst_w;
+__global__
+void bspline3_prefilter_rows_f64(
+    double* __restrict__ c,   // [h × w] image, modified in-place
+    int w, int h)
+{
+    int row = threadIdx.x + blockDim.x * blockIdx.x;
+    if (row >= h) return;
 
-    // src_coords is in [0, N-1] coordinates (if valid), so we can directly use it for texturing.
-    // the sampler automatically handles out-of-bounds by returning 0, so we don't need an explicit check here.
+    const double z1 = -0.26794919243112270647;  // -2 + sqrt(3)
+    const double lambda = 6.0;                   // normalization
+    const int K = 24;  // mirror horizon: |z1|^24 ≈ 2.6e-14, below f64 eps
 
-    dst_img[idx] = texture_catmull_rom(src_img, src_coords[idx*2], src_coords[idx*2 + 1], img_shape[1], img_shape[0]);
+    int base = row * w;
+
+    // ── Causal pass: mirror boundary ──
+    // c⁺[0] = sum_{k=0..K} z1^k * c[mirror(k)]
+    double c_plus = c[base + 0];
+    double z1k = z1;
+    for (int k = 1; k <= K && k < 2*w-2; k++) {
+        int mk = (k < w) ? k : (2*w - 2 - k);  // mirror index
+        c_plus += z1k * c[base + mk];
+        z1k *= z1;
+    }
+    c[base + 0] = c_plus;
+
+    for (int i = 1; i < w; i++)
+        c[base + i] = c[base + i] + z1 * c[base + i - 1];
+
+    // ── Anticausal pass ──
+    // Initial condition: c⁻[N-1] = z1/(z1²-1) * (c⁺[N-1] + z1*c⁺[N-2])
+    c[base + w-1] = z1 / (z1*z1 - 1.0) *
+                    (c[base + w-1] + z1 * c[base + w-2]);
+
+    for (int i = w - 2; i >= 0; i--)
+        c[base + i] = z1 * (c[base + i + 1] - c[base + i]);
+
+    // ── Scale ──
+    for (int i = 0; i < w; i++)
+        c[base + i] *= lambda;
 }
+
+__global__
+void bspline3_prefilter_cols_f64(
+    double* __restrict__ c,   // [h × w] image, modified in-place
+    int w, int h)
+{
+    int col = threadIdx.x + blockDim.x * blockIdx.x;
+    if (col >= w) return;
+
+    const double z1 = -0.26794919243112270647;
+    const double lambda = 6.0;
+    const int K = 24;
+
+    // stride = w (column-major access within row-major layout)
+
+    // ── Causal pass: mirror boundary ──
+    double c_plus = c[0 * w + col];
+    double z1k = z1;
+    for (int k = 1; k <= K && k < 2*h-2; k++) {
+        int mk = (k < h) ? k : (2*h - 2 - k);
+        c_plus += z1k * c[mk * w + col];
+        z1k *= z1;
+    }
+    c[0 * w + col] = c_plus;
+
+    for (int i = 1; i < h; i++)
+        c[i * w + col] = c[i * w + col] + z1 * c[(i-1) * w + col];
+
+    // ── Anticausal pass ──
+    c[(h-1) * w + col] = z1 / (z1*z1 - 1.0) *
+                         (c[(h-1) * w + col] + z1 * c[(h-2) * w + col]);
+
+    for (int i = h - 2; i >= 0; i--)
+        c[i * w + col] = z1 * (c[(i+1) * w + col] - c[i * w + col]);
+
+    // ── Scale ──
+    for (int i = 0; i < h; i++)
+        c[i * w + col] *= lambda;
+}
+
+// Generated by Claude Opus 4.6 on 2026 March 17.
+// I was hoping to construct it from the chain above :(
+__device__
+double texture_cubic_b(
+    const double* __restrict__ img,
+    double x, double y,
+    int w, int h)
+{
+    int ix = (int)floor(x);
+    int iy = (int)floor(y);
+    double tx = x - floor(x);//(double)ix;
+    double ty = y - floor(y);//(double)iy;
+
+    double wx[4], wy[4];
+    double omt = 1.0 - tx;
+    wx[0] = omt * omt * omt * (1.0/6.0);
+    wx[1] = (3.0*tx*tx*tx - 6.0*tx*tx + 4.0) * (1.0/6.0);
+    wx[2] = (-3.0*tx*tx*tx + 3.0*tx*tx + 3.0*tx + 1.0) * (1.0/6.0);
+    wx[3] = tx * tx * tx * (1.0/6.0);
+    
+    double omt_y = 1.0 - ty;
+    wy[0] = omt_y * omt_y * omt_y * (1.0/6.0);
+    wy[1] = (3.0*ty*ty*ty - 6.0*ty*ty + 4.0) * (1.0/6.0);
+    wy[2] = (-3.0*ty*ty*ty + 3.0*ty*ty + 3.0*ty + 1.0) * (1.0/6.0);
+    wy[3] = ty * ty * ty * (1.0/6.0);
+
+    double val = 0.0;
+    for (int m = 0; m < 4; m++)
+        for (int n = 0; n < 4; n++)
+            val += wx[n] * wy[m] * textel(img, ix+n-1, iy+m-1, w, h);
+
+    return val;
+}
+
+// __global__ // I dont think I'm going to test this :)
+// void texture_resample_f64(
+//     double* __restrict__ dst_img,
+//     double* __restrict__ src_img,
+//     double* __restrict__ src_coords, // [N_pts, 2]
+//     int dst_h, 
+//     int dst_w
+// ){
+//     int idx;
+//     if(mapidx(&idx, dst_w, dst_h)) return; // Map 2D thread/block indices to a 1D index, return if out of bounds
+//     // idx is now bounded and has the right index!
+// 
+//     //int x = idx % dst_w;
+//     //int y = idx / dst_w;
+// 
+//     // src_coords is in [0, N-1] coordinates (if valid), so we can directly use it for texturing.
+//     // the sampler automatically handles out-of-bounds by returning 0, so we don't need an explicit check here.
+// 
+//     dst_img[idx] = texture_catmull_rom(src_img, src_coords[idx*2], src_coords[idx*2 + 1], img_shape[1], img_shape[0]);
+// }
 
 // Context for you mr ai :)
 // struct __align__(8) TESS_Mapping_Struct {
@@ -1341,47 +1461,61 @@ void texture_resample_f64(
 // };
 
 // The big one >:)
-// __global__ // Remaps pixels from src onto dst. do NOT have dst's pixels loaded into memory, that's where this writes.
-// void cuda_hcongrid_f64(
-//     double* __restrict__ dst_img,
-//     double* __restrict__ src_img,
-//     TESS_Mapping_Struct* dst,
-//     TESS_Mapping_Struct* src,
-// ){
-//     int idx;
-//     if(mapidx(&idx, dst->img_shape[1], dst->img_shape[0])) return; // Map 2D thread/block indices to a 1D index, return if out of bounds
-//     // idx is now bounded and has the right index!
+__global__ // Remaps pixels from src onto dst. do NOT have dst's pixels loaded into memory, that's where this writes.
+void cuda_hcongrid_f64(
+    double* __restrict__ dst_img,
+    double* __restrict__ src_img
+    // TESS_Mapping_Struct* dst,
+    // TESS_Mapping_Struct* src
+){
+    TESS_Mapping_Struct* dst = &dst_data;
+    TESS_Mapping_Struct* src = &src_data;
 
-//     // It looks like I dont need to allocate anything more than what's here. Yippee!
+    //int idx;
+    //if(mapidx(&idx, dst->img_shape[1], dst->img_shape[0])) return; // Map 2D thread/block indices to a 1D index, return if out of bounds
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (idx >= dst->img_shape[0] * dst->img_shape[1]) return;
+    // idx is now bounded and has the right index!
 
-//     // Let's sketch the entire shader.
-//     // 1. Generate a pixel coordinate for this thread. (dst's coordinates)
-//     // 2. Map dst -> ICRS
-//     // 3. Map ICRS -> src
-//     // 4. Sample src at the mapped coordinate.
-//     // 5. Write to dst.'
-//     // 6. Yippee!
+    // It looks like I dont need to allocate anything more than what's here. Yippee!
 
-//     // 1. Generate pixel coordinate [0, N)
-//     int x = idx % dst->img_shape[1]; // These pictures are always 2048x2048. I wonder if we should hardcode this. eh
-//     int y = idx / dst->img_shape[1];
+    // Let's sketch the entire shader.
+    // 1. Generate a pixel coordinate for this thread. (dst's coordinates)
+    // 2. Map dst -> ICRS
+    // 3. Map ICRS -> src
+    // 4. Sample src at the mapped coordinate.
+    // 5. Write to dst.'
+    // 6. Yippee!
 
-//     // 2. Map dst -> ICRS
-//     double xy[2] = {(double)x, (double)y};
-//     double icrs[3];
-//     ICRS_from_TESS_cuda_f64(icrs, xy, dst);
-//     
-//     // 3. Map ICRS -> src
-//     TESS_from_ICRS_cuda_f64(xy, icrs, src);
+    // 1. Generate pixel coordinate [0, N)
+    int x = idx % dst->img_shape[1]; // These pictures are always 2048x2048. I wonder if we should hardcode this. eh
+    int y = idx / dst->img_shape[1];
 
-//     // 4. Sample src at the mapped coordinate.
-//     double lum = texture_catmull_rom(src_img, xy[0], xy[1], src->img_shape[1], src->img_shape[0]);
+    // 2. Map dst -> ICRS
+    double xy[2] = {(double)x, (double)y};
+    double icrs[3];
+    ICRS_from_TESS_cuda_f64(icrs, xy, dst);
+    double mag = sqrt(icrs[0]*icrs[0] + icrs[1]*icrs[1] + icrs[2]*icrs[2]);
+    for(int i=0; i<3; i++)
+        icrs[i] /= mag; // Normalize to unit vector. This is important for numerical stability in the next step, which involves a matrix multiplication with the R_ij matrix that can have large values.
+    
+    // 3. Map ICRS -> src
+    TESS_from_ICRS_cuda_f64(xy, icrs, src);
 
-//     // 5. Write to dst.
-//     dst_img[idx] = lum;
+    // 4. Sample src at the mapped coordinate.
+    //double lum = texture_catmull_rom(src_img, xy[0], xy[1], src->img_shape[1], src->img_shape[0]);
+    double lum = texture_cubic_b(src_img, xy[0], xy[1], src->img_shape[1], src->img_shape[0]);
 
-//     // 6. Yippee!
-// }
+    // 5. Write to dst.
+    dst_img[idx] = lum;
+    //dst_img[idx] = xy[0]; //  Validate that data flows through properly
+
+    //double dx = xy[0] - (double)x;
+    //double dy = xy[1] - (double)y;
+    //dst_img[idx] = sqrt(dx*dx + dy*dy);
+
+    // 6. Yippee!
+}
 
 """
 # Sanitize
@@ -1410,27 +1544,28 @@ krnl = nvcc.SourceModule(cu_code)
 #     double inv_AB[50];         // 400 bytes
 # };
 
-# TESS_Mapping_Struct_dtype = np.dtype([
-#     ('img_shape',      np.int32, (2,)),  #  8 bytes
-#     ('ref_px_coord', np.float64, (2,)),  #  16 bytes
-#     ('cd',           np.float64, (4,)),  #  32 bytes
-#     ('cd_inv',       np.float64, (4,)),  #  32 bytes
-#     ('Rotation',     np.float64, (9,)),  #  72 bytes
-#     ('fwd_AB',       np.float64, (50,)), # 400 bytes
-#     ('inv_AB',       np.float64, (50,)), # 400 bytes
-# ], align=True)
-# 
-# def pack_TMS(TESS_Mapping_Struct, data):
-#     """Pack a WCSMappingStruct into a single numpy buffer matching the CUDA struct."""
-#     TMS = np.zeros(1, dtype=TESS_Mapping_Struct_dtype)
-#     TMS['img_shape']    = np.array(TESS_Mapping_Struct.img_shape_i, dtype=np.int32)
-#     TMS['ref_px_coord'] = TESS_Mapping_Struct.ref_px_coord_i.ravel().astype(np.float64)
-#     TMS['cd']           = TESS_Mapping_Struct.cd_matrix_ij.ravel().astype(np.float64)
-#     TMS['cd_inv']       = TESS_Mapping_Struct.cd_matrix_inv_ij.ravel().astype(np.float64)
-#     TMS['Rotation']     = TESS_Mapping_Struct.R_ij.ravel().astype(np.float64)
-#     TMS['fwd_AB']       = TESS_Mapping_Struct.fwd_distortion_coeffs_kij.ravel().astype(np.float64)
-#     TMS['inv_AB']       = TESS_Mapping_Struct.inv_distortion_coeffs_kij.ravel().astype(np.float64)
-#     return TMS
+TESS_Mapping_Struct_dtype = np.dtype([
+    ('img_shape',      np.int32, (2,)),  #  8 bytes
+    ('ref_px_coord', np.float64, (2,)),  #  16 bytes
+    ('cd',           np.float64, (4,)),  #  32 bytes
+    ('cd_inv',       np.float64, (4,)),  #  32 bytes
+    ('Rotation',     np.float64, (9,)),  #  72 bytes
+    ('fwd_AB',       np.float64, (50,)), # 400 bytes
+    ('inv_AB',       np.float64, (50,)), # 400 bytes
+], align=True)
+
+def pack_TMS(TESS_Mapping_Struct):
+    """Pack a WCSMappingStruct into a single numpy buffer matching the CUDA struct."""
+    TMS = np.zeros(1, dtype=TESS_Mapping_Struct_dtype)
+    #globals().update(locals())
+    TMS['img_shape']    = np.array(TESS_Mapping_Struct.naxis_int_i, dtype=np.int32)
+    TMS['ref_px_coord'] = TESS_Mapping_Struct.ref_px_coord_i.ravel().astype(np.float64)
+    TMS['cd']           = TESS_Mapping_Struct.cd_matrix_ij.ravel().astype(np.float64)
+    TMS['cd_inv']       = TESS_Mapping_Struct.cd_matrix_inv_ij.ravel().astype(np.float64)
+    TMS['Rotation']     = TESS_Mapping_Struct.R_ij.ravel().astype(np.float64)
+    TMS['fwd_AB']       = TESS_Mapping_Struct.fwd_distortion_coeffs_kij.ravel().astype(np.float64)
+    TMS['inv_AB']       = TESS_Mapping_Struct.inv_distortion_coeffs_kij.ravel().astype(np.float64)
+    return TMS
 
 class CUDAContainer:
     def __init__(self):
@@ -1439,302 +1574,221 @@ class CUDAContainer:
         #self.ftype = np.float32
 
     # Runs on the first call to initialize kernels as a "JIT" approach.
-    def initialize(self, TESS_Mapping_Struct, vertex_buffer_ni):
+    def initialize(self, data, header): # loaded from data, header <<= fits.open("file.fits", header=True)
         if self.initialized:
             return
         
-        self.cu_distort_sip = krnl.get_function("distort_sip_cuda_f64")
-        #self.cu_distort_sip = krnl.get_function("distort_sip_cuda_f32")
-        self.cu_wcs_map_ICRS_from_TESS = krnl.get_function("wcs_map_ICRS_from_TESS_cuda_f64")
-        self.cu_wcs_map_TESS_from_ICRS = krnl.get_function("wcs_map_TESS_from_ICRS_cuda_f64")
+        self.cu_prefilter_rows = krnl.get_function("bspline3_prefilter_rows_f64")
+        self.cu_prefilter_cols = krnl.get_function("bspline3_prefilter_cols_f64")
+        self.cu_hcongrid_f64 = krnl.get_function("cuda_hcongrid_f64")
+
+        dst_Mapping_Variables = wcs_variables_load_nonan(header, wcs_variables_validate(header))
+        dst_Mapping_Struct = wcs_assemble_struct(dst_Mapping_Variables)
+        self.dst_Mapping_Variables = dst_Mapping_Variables # Just in case we need it!
+        self.dst_Mapping_Struct = dst_Mapping_Struct # Just in case we need it!
 
         # Initialize constant memory parameters
-        c_ref_px_coord = TESS_Mapping_Struct.ref_px_coord_i.astype(self.ftype).ravel()
-        g_ref_px_coord, g_ref_px_coord_size = krnl.get_global("ref_px_coord_i")
-
-        c_cd = TESS_Mapping_Struct.cd_matrix_ij.astype(self.ftype).ravel()
-        g_cd, g_cd_size = krnl.get_global("cd_ij")
-
-        c_cd_inv = TESS_Mapping_Struct.cd_matrix_inv_ij.astype(self.ftype).ravel()
-        g_cd_inv, g_cd_inv_size = krnl.get_global("cd_inv_ij")
-
-        c_Rotation = TESS_Mapping_Struct.R_ij.astype(self.ftype).ravel()
-        g_Rotation, g_Rotation_size = krnl.get_global("Rotation_ij") 
-
-        c_fwd_AB = TESS_Mapping_Struct.fwd_distortion_coeffs_kij.astype(self.ftype).ravel()
-        g_fwd_AB, g_fwd_AB_size = krnl.get_global("fwd_AB")
-
-        c_inv_AB = TESS_Mapping_Struct.inv_distortion_coeffs_kij.astype(self.ftype).ravel()
-        g_inv_AB, g_inv_AB_size = krnl.get_global("inv_AB")
-
-        c_N_pts = np.array([vertex_buffer_ni.shape[0]], np.int32)
-        g_N_pts, g_N_pts_size = krnl.get_global("N_pts")
+        g_dst_data, g_dst_data_size = krnl.get_global("dst_data")
+        g_src_data, g_src_data_size = krnl.get_global("src_data")
+        drv.memcpy_htod(g_dst_data, pack_TMS(dst_Mapping_Struct))
+        drv.memcpy_htod(g_src_data, pack_TMS(dst_Mapping_Struct)) # Preventing garbage
+        # incredible
+        #drv.memcpy_htod(g_dst_data, 
+        #     pack_TMS(wcs_assemble_struct(wcs_variables_load_nonan(header, wcs_variables_validate(header)))))
 
         # Initialize variable memory
-        c_distort = np.empty_like(vertex_buffer_ni.ravel(), dtype=self.ftype)
-        g_distort = drv.mem_alloc(c_distort.nbytes)
+        c_dst = np.empty_like(data.ravel(), dtype=self.ftype)
+        g_dst = drv.mem_alloc(c_dst.nbytes)
+        g_src = drv.mem_alloc(c_dst.nbytes) # src and dst are the same size, so we can reuse the buffer size.
+        # We will copy the actual data in each call, but we need to allocate the GPU memory here.
 
-        c_vb = vertex_buffer_ni.astype(self.ftype).ravel()
-        g_vb = drv.mem_alloc(c_vb.nbytes)
+        #c_dst[:] = data.ravel().astype(self.ftype) # Fill with trash to test
+        #drv.memcpy_htod(g_dst, c_dst) # this will be immediately deleted
 
-        c_icrs = np.empty((vertex_buffer_ni.shape[0], 3), dtype=self.ftype).ravel()
-        g_icrs = drv.mem_alloc(c_icrs.nbytes)
+        self.g_dst_data, self.g_dst_data_size = g_dst_data, g_dst_data_size
+        self.g_src_data, self.g_src_data_size = g_src_data, g_src_data_size
 
-        self.c_ref_px_coord, self.g_ref_px_coord = c_ref_px_coord, g_ref_px_coord
-        self.c_cd, self.g_cd = c_cd, g_cd
-        self.c_cd_inv, self.g_cd_inv = c_cd_inv, g_cd_inv
-        self.c_Rotation, self.g_Rotation = c_Rotation, g_Rotation
-        self.c_fwd_AB, self.g_fwd_AB = c_fwd_AB, g_fwd_AB
-        self.c_inv_AB, self.g_inv_AB = c_inv_AB, g_inv_AB
-        self.c_N_pts, self.g_N_pts = c_N_pts, g_N_pts
-
-        self.c_distort, self.g_distort = c_distort, g_distort
-        self.c_vb, self.g_vb = c_vb, g_vb
-        self.c_icrs, self.g_icrs = c_icrs, g_icrs
+        self.g_dst, self.c_dst = g_dst, c_dst
+        self.g_src, self.c_src = g_src, c_dst.copy()
 
         self.initialized = True
-
-    def upload_constants(self, TESS_Mapping_Struct, n_pts):
-        # This should be a constant buffer upload, but I'm a little uneasy of packing this in numpy.
-        # I'll do it manually for now, but if this works we should wrap it in a nice API.
-
-        self.c_ref_px_coord[:] = TESS_Mapping_Struct.ref_px_coord_i.ravel().astype(self.ftype)
-        drv.memcpy_htod(self.g_ref_px_coord, self.c_ref_px_coord)
-
-        self.c_cd[:] = TESS_Mapping_Struct.cd_matrix_ij.ravel().astype(self.ftype)
-        drv.memcpy_htod(self.g_cd, self.c_cd)
-
-        self.c_cd_inv[:] = TESS_Mapping_Struct.cd_matrix_inv_ij.ravel().astype(self.ftype)
-        drv.memcpy_htod(self.g_cd_inv, self.c_cd_inv)
-
-        self.c_Rotation[:] = TESS_Mapping_Struct.R_ij.ravel().astype(self.ftype)
-        drv.memcpy_htod(self.g_Rotation, self.c_Rotation)
-
-        self.c_fwd_AB[:] = TESS_Mapping_Struct.fwd_distortion_coeffs_kij.ravel().astype(self.ftype)
-        drv.memcpy_htod(self.g_fwd_AB, self.c_fwd_AB)
-
-        self.c_inv_AB[:] = TESS_Mapping_Struct.inv_distortion_coeffs_kij.ravel().astype(self.ftype)
-        drv.memcpy_htod(self.g_inv_AB, self.c_inv_AB)
-
-        self.c_N_pts[0] = n_pts
-        drv.memcpy_htod(self.g_N_pts, self.c_N_pts)
-
-    def distort_sip(self, TESS_Mapping_Struct, distort, vb):
-        self.initialize(TESS_Mapping_Struct, vb)
-        self.upload_constants(TESS_Mapping_Struct, vb.shape[0])
-
-        self.c_vb[:] = vb.ravel().astype(self.ftype)
-        drv.memcpy_htod(self.g_vb, self.c_vb)
-
-        self.cu_distort_sip(
-            self.g_distort,
-            self.g_vb,
-            block=(256,1,1), grid=((vb.shape[0] + 255) // 256, 1)
-        )
-
-        drv.memcpy_dtoh(self.c_distort, self.g_distort)
-        return self.c_distort.reshape(vb.shape)
-
-    def wcs_map_ICRS_from_TESS_SLOW(self, src, src_pixel_ni):
-        R0 = 180.0 / np.pi
-
-        uv_ni = src_pixel_ni - (src.ref_px_coord_i - 1)# / 2 # Center at the middle of the pixel grid. This is in [0, N-1] coordinates.
-        distort_ni = np.empty_like(uv_ni)
-        self.distort_sip(src, distort_ni, uv_ni)
-        uv_ni += distort_ni
-        xy_ni = (src.cd_matrix_ij @ uv_ni.T).T
-        xyz_ni = np.pad(xy_ni, ((0,0),(0,1)))
-        xyz_ni[:,2] = R0
-
-        # Rotate to ICRS. This is where we halt!
-        icrs_xyz_ni = (src.R_ij @ xyz_ni.T).T
-        return icrs_xyz_ni
     
-    def wcs_map_ICRS_from_TESS(self, src, src_pixel_ni):
-        self.initialize(src, src_pixel_ni)
-        self.upload_constants(src, src_pixel_ni.shape[0])
+    def hcongrid(self, src_data, src_header):
 
-        self.c_vb[:] = src_pixel_ni.ravel().astype(self.ftype)
-        drv.memcpy_htod(self.g_vb, self.c_vb)
+        if src_data.ravel().shape != self.c_dst.shape:
+            raise ValueError(f"Source data shape {src_data.shape} does not match destination shape {self.c_dst.shape}.")
 
-        self.cu_wcs_map_ICRS_from_TESS(
-            self.g_icrs,
-            self.g_vb,
-            block=(256,1,1), grid=((src_pixel_ni.shape[0] + 255) // 256, 1)
+        drv.memcpy_htod(self.g_src, src_data.ravel().astype(self.ftype))
+
+        guh = wcs_assemble_struct(wcs_variables_load_nonan(src_header, wcs_variables_validate(src_header))) # This is the one that actually matters. We need to update the WCS parameters for the source image!
+        #print(guh)
+        drv.memcpy_htod(self.g_src_data, pack_TMS(guh))
+
+        h, w = self.dst_Mapping_Struct.naxis_int_i
+        h, w = int(h), int(w)
+
+        # Prefilter the source image in-place on GPU
+        self.cu_prefilter_rows(
+            self.g_src, np.int32(w), np.int32(h),
+            block=(256,1,1), grid=((h + 255) // 256, 1))
+        self.cu_prefilter_cols(
+            self.g_src, np.int32(w), np.int32(h),
+            block=(256,1,1), grid=((w + 255) // 256, 1))
+
+        self.cu_hcongrid_f64(
+            self.g_dst,
+            self.g_src,
+            #block=(256,1,1), grid=((self.c_dst.size + 255) // 256, 1)
+            #block=(16,16,1), grid=((w + 15) // 16, (h + 15) // 16)
+            block=(256,1,1), grid=((w*h + 255) // 256, 1)
         )
 
-        drv.memcpy_dtoh(self.c_icrs, self.g_icrs)
-        return self.c_icrs.reshape((src_pixel_ni.shape[0], 3))
-    
-    def wcs_map_TESS_from_ICRS(self, dst, icrs_xyz_ni):
-        self.initialize(dst, icrs_xyz_ni)
-        self.upload_constants(dst, icrs_xyz_ni.shape[0])
+        #print("Yippee!")
+        #globals().update(locals()) # For interactive inspection
 
-        self.c_icrs[:] = icrs_xyz_ni.ravel().astype(self.ftype)
-        drv.memcpy_htod(self.g_icrs, self.c_icrs)
-
-        self.cu_wcs_map_TESS_from_ICRS(
-            self.g_vb,
-            self.g_icrs,
-            block=(256,1,1), grid=((icrs_xyz_ni.shape[0] + 255) // 256, 1)
-        )
-
-        drv.memcpy_dtoh(self.c_vb, self.g_vb)
-        return self.c_vb.reshape((icrs_xyz_ni.shape[0], 2))
+        drv.memcpy_dtoh(self.c_dst, self.g_dst)
+        return self.c_dst.reshape(src_data.shape).copy()
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 #  Coordinate Validation
 # ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
+def slog(img):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        result = np.log(img)
+    # Find the value that is the smallest non nan, non inf value in the image
+    mask = np.isfinite(result) 
+    #vmin = result[mask].min() # ValueError: zero-size array to reduction operation minimum which has no identity
+    vmin = result[mask].min() if np.any(mask) else 0
+    result[~mask] = vmin
+    return result
+
+# Simple log luminance tonemapper. Taken from visualizer.py.
+def tonemap(img):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        #ld = np.log(img)
+        ld = slog(img)
+    ld_fltr = ld[~np.isnan(ld) & ~np.isinf(ld)]
+    ld_nan = np.nan_to_num(ld, nan=np.nanmax(ld_fltr), neginf=np.nanmin(ld_fltr), posinf=np.nanmax(ld_fltr))
+    histo, bin_edges = np.histogram(ld_nan, bins=4096)
+    bins = (bin_edges[:-1] + bin_edges[1:]) / 2
+    cs_histo = np.cumsum(histo)
+    cdf_histo = cs_histo.astype(np.float64) / cs_histo[-1].astype(np.float64)
+    ld_mapped = np.interp(ld_nan, bins, cdf_histo)
+    return ld_mapped
+
+from astropy.nddata.utils import Cutout2D
+def crop(data__, header__):
+    cutout = Cutout2D(data__, (1068,1024), (2048, 2048), wcs=WCS(header__))
+    header__['CRPIX1'] = 1001. # uh
+    header__['NAXIS1'] = 2048  # there's gotta be a more robust way. 
+    header__['NAXIS2'] = 2048  # Claude opus 4.6 checked and said this is equivelant to cutout's but this feels fragile. eh
+    #return cutout.data.astype(np.float64), header
+    # Lets hand do this crop. Its being irritating.
+    # 1068,1024 is the *center* of the crop, with 2048,2048 as the size. So we need to go from 1068-1024 to 1068+1024 in x, and 1024-1024 to 1024+1024 in y.
+    #print(data__.shape)
+    data__ = cutout.data.astype(np.float64)
+    #print(f"Cropped data shape: {data__.shape}")
+    return data__, header__
+
+
 # Old validation sampler built by Claude Opus 4.6 on 2026 March 14. We'll need to rebuild it for the new API.
-def validate_coordinate_transforms(n_samples=4194304): # 2048*2048 #(n_samples=10000):
+def validate_hcongrid():
     """
-    Compare our transform against astropy's all_pix2world for random
-    pixels.  Reports angular separation statistics in arcseconds.
+    gulp
     """
     rng = np.random.default_rng(42)
     timers = ProfileTimer()
 
-    files = get_file_list()
-    data, header = fits.getdata(files[0], header=True)
-    
+    files = get_file_list(1,4)
+
+    # Load the first file as our reference
+    print(f"Loading reference file: {files[0]}")
+    data0, header0 = crop(*fits.getdata(files[0], header=True))
+    #data0 = data0*2.0
+
     cuda = CUDAContainer()
+    cuda.initialize(data0, header0) # JIT initialize the kernels and constant memory with the reference image's WCS parameters.
+    #data0 = data0/2.0
 
-    scope = locals()
+    test_output0 = cuda.hcongrid(data0, header0).reshape(data0.shape) # Just to test that it runs without error. This will be overwritten in the loop below when we test with different source images, but it serves as a sanity check that the kernel is basically working.
 
-    # Iterate a few times to saturate the profiler
-    maxiters = 11
-    for n in range(maxiters):
-        with timers["wcs_variables_validate"]:
-            keys = wcs_variables_validate(header)
-        with timers["wcs_variables_load_nonan"]:
-            TESS_Mapping_Variables = wcs_variables_load_nonan(header, keys)
-        with timers["wcs_assemble_struct"]:
-            TESS_Mapping_Struct = wcs_assemble_struct(TESS_Mapping_Variables)
+    cuda.hcongrid(data0, header0) # Test that repeated calls work and that the GPU memory is being reused correctly. If this fails, we might have a memory leak or some issue with how we're managing GPU memory.
+    import warnings, astropy
+    frames = []
+    for n in range(100):
+        with timers["fits.getdata"]:
+            warnings.filterwarnings("ignore", category=astropy.wcs.wcs.FITSFixedWarning)
+            data1, header1 = crop(*fits.getdata(files[n], header=True))
+        with timers["cuda.hcongrid"]:
+            try:
+                test_output1 = cuda.hcongrid(data1, header1)
+                frames.append((test_output1, data1, header1)) # Store the outputs for later inspection
+            except Exception as e:
+                print(f"Error processing file {files[n]}: {e}")
+        if n%1 == 0:
+            print(f"Processed {n+1}/{len(files)} files.")
 
-        with timers["sample generation"]:
-            ξ_ni = np.random.random((n_samples, 2)).astype(np.float64)
-            uv_ni = ξ_ni * (TESS_Mapping_Struct.naxis_i[None, :] - 1.0)
-
-        # Astropy Implementation=
-        with timers["astropy pre"]:
-            wcs = WCS(header)
-            px, py = uv_ni[:,0], uv_ni[:,1]
-        with timers["astropy all_pix2world"]:
-            ra_ap, dec_ap = wcs.all_pix2world(px, py, 0)
-        #with timers["astropy post"]:
-        if True:
-            # Convert to unit sphere
-            c_ra_ap, s_ra_ap = np.cos(np.radians(ra_ap)), np.sin(np.radians(ra_ap))
-            c_dec_ap, s_dec_ap = np.cos(np.radians(dec_ap)), np.sin(np.radians(dec_ap))
-
-            x_ap = c_dec_ap * c_ra_ap
-            y_ap = c_dec_ap * s_ra_ap
-            z_ap = s_dec_ap
-
-            xyz_ap = np.stack([x_ap, y_ap, z_ap], axis=-1)
-
-        # Custom implementation
-        with timers["custom ICRS from TESS"]:
-            xyz_custom = wcs_map_ICRS_from_TESS_SLOW(TESS_Mapping_Struct, uv_ni)
-        #with timers["custom post"]:
-        if True:
-            xyz_custom /= np.linalg.norm(xyz_custom, axis=-1, keepdims=True)
-
-        # Custom CUDA implementation
-        with timers["custom CUDA ICRS from TESS (Slow)"]:
-            xyz_cuda = cuda.wcs_map_ICRS_from_TESS_SLOW(TESS_Mapping_Struct, uv_ni)
-
-        #with timers["custom CUDA post"]:
-        if True:
-            xyz_cuda /= np.linalg.norm(xyz_cuda, axis=-1, keepdims=True)
-            print(f"Custom CUDA implementation max radius from unit sphere: {np.max(np.abs(xyz_ap - xyz_custom), axis=0)[:5]},")
-
-        with timers["custom CUDA ICRS from TESS"]:
-            xyz_cuda = cuda.wcs_map_ICRS_from_TESS(TESS_Mapping_Struct, uv_ni)
-        if True:
-            xyz_cuda /= np.linalg.norm(xyz_cuda, axis=-1, keepdims=True)
-            print(f"Custom CUDA implementation max radius from unit sphere: {np.max(np.abs(xyz_ap - xyz_custom), axis=0)[:5]},")
+    # fig, ax = plt.subplots()
+    # ax.imshow(test_output1, origin='lower')
+    # plt.show()
+    # raise Exception()
 
 
-        with timers["custom CUDA TESS from ICRS"]:
-            uv_ni_reversal_cuda = cuda.wcs_map_TESS_from_ICRS(TESS_Mapping_Struct, xyz_cuda)
-        if True:
-            print(f"Custom CUDA reversal max error: {np.max(np.abs(uv_ni_reversal_cuda - uv_ni), axis=0)[:5]},")
-        with timers["custom TESS from ICRS"]:
-            uv_ni_reversal = wcs_map_TESS_from_ICRS_SLOW(TESS_Mapping_Struct, xyz_custom)
-        with timers["custom TESS from ICRS"]:
-            uv_ni_reversal_2 = wcs_map_TESS_from_ICRS_SLOW(TESS_Mapping_Struct, xyz_ap)
-        with timers["astropy world2pix"]:
-            uv_ni_reversal_api = np.array(wcs.all_world2pix(ra_ap, dec_ap, 0)).T
-        scope.update(locals()) # For interactive inspection
-        print(f"Iteration {n+1}/{maxiters} complete.")
-        if n != 0:
-            print(timers)
-
-    if False:
-        # Cast TESS_Mapping_Struct to float32 for testing.
-        TESS_Mapping_Struct_float = {**TESS_Mapping_Struct._asdict()} # Dict copy
-        for key, value in TESS_Mapping_Struct._asdict().items():
-            if isinstance(value, np.ndarray) and value.dtype == np.float32:
-                TESS_Mapping_Struct_float[key] = value.astype(np.float64)
-            elif isinstance(value, float):
-                TESS_Mapping_Struct_float[key] = float(value)
-            else:
-                TESS_Mapping_Struct_float[key] = value
-        TESS_Mapping_Struct_float = WCSMappingStruct(**TESS_Mapping_Struct_float) # Convert back to struct
-            
-        xyz_custom = wcs_map_ICRS_from_TESS_SLOW(TESS_Mapping_Struct_float, uv_ni.astype(np.float32))
-        xyz_custom /= np.linalg.norm(xyz_custom, axis=-1, keepdims=True)
-        xyz_custom = xyz_custom.astype(np.float64) # Cast back to float64 for comparison. This is a bit sad but it allows us to test the float32 implementation against astropy's float64.
-
-    # Angular seperation
-    θ_n = np.arccos(np.clip(np.sum(xyz_ap * xyz_custom, axis=-1), -1.0, 1.0))
-    sep_arcsec = np.degrees(θ_n) * 3600.0
-
-    result = {
-        'n_samples': n_samples,
-        'max_error_arcsec': float(np.max(sep_arcsec)),
-        'mean_error_arcsec': float(np.mean(sep_arcsec)),
-        'median_error_arcsec': float(np.median(sep_arcsec)),
-        'max_error_delta': str(np.max(np.abs(xyz_ap - xyz_custom), axis=0)),
-        'mean_error_delta': str(np.mean(np.abs(xyz_ap - xyz_custom), axis=0)),
-        'median_error_delta': str(np.median(np.abs(xyz_ap - xyz_custom), axis=0)),
-    }
-
-    print(f"\nValidation against astropy WCS ({n_samples} random pixels):")
-    print(f"  Max error:    {result['max_error_arcsec']:.6e} arcsec")
-    print(f"  Mean error:   {result['mean_error_arcsec']:.6e} arcsec")
-    print(f"  Median error: {result['median_error_arcsec']:.6e} arcsec")
-    print(f"  Max error (delta):    {result['max_error_delta']}")
-    print(f"  Mean error (delta):   {result['mean_error_delta']}")
-    print(f"  Median error (delta): {result['median_error_delta']}")
-
-    tess_pixel_arcsec = 21.0
-    print(f"  (TESS pixel scale: {tess_pixel_arcsec} arcsec/pixel)")
-    print(f"  Max error = {result['max_error_arcsec']/tess_pixel_arcsec:.2e} pixels")
-
-    globals().update(locals()) # For interactive inspection
-
-    # with timers["custom TESS from ICRS"]:
-    #     uv_ni_reversal = wcs_map_TESS_from_ICRS_SLOW(TESS_Mapping_Struct, xyz_custom)
-    # with timers["custom TESS from ICRS"]:
-    #     uv_ni_reversal_2 = wcs_map_TESS_from_ICRS_SLOW(TESS_Mapping_Struct, xyz_ap)
-    # with timers["astropy world2pix"]:
-    #     uv_ni_reversal_api = np.array(wcs.all_world2pix(ra_ap, dec_ap, 0)).T
-
-    uv_ni_reversal_error = uv_ni_reversal - uv_ni
-    uv_ni_reversal_2_error = uv_ni_reversal_2 - uv_ni
-    uv_ni_reversal_api_error = uv_ni_reversal_api - uv_ni
-
-    print(f"Reversal error ( custom → custom ): max={np.max(np.abs(uv_ni_reversal_error)):.3e} pixels, mean={np.mean(np.abs(uv_ni_reversal_error)):.3e} pixels")
-    print(f"Reversal error (astropy → custom ): max={np.max(np.abs(uv_ni_reversal_2_error)):.3e} pixels, mean={np.mean(np.abs(uv_ni_reversal_2_error)):.3e} pixels")
-    print(f"Reversal error (astropy → astropy): max={np.max(np.abs(uv_ni_reversal_api_error)):.3e} pixels, mean={np.mean(np.abs(uv_ni_reversal_api_error)):.3e} pixels")
-
-    globals().update(locals())
+    from FITS_tools.hcongrid import hcongrid
+    ctrl_output0 = hcongrid(data0, header0, header0, prefilter=True) # Null map
+    with timers["astropy.hcongrid"]:
+        ctrl_output1 = hcongrid(data1, header1, header0, prefilter=True)
 
     print(timers)
     globals().update(locals()) # For interactive inspection
+
+    if False:
+        fig, ax = plt.subplots(2,3, figsize=(15,10))
+        ax[0,0].imshow(tonemap(test_output0), origin='lower')
+        ax[1,0].imshow(tonemap(test_output1), origin='lower')
+        ax[0,1].imshow(tonemap(ctrl_output0), origin='lower')
+        ax[1,1].imshow(tonemap(ctrl_output1), origin='lower')
+
+        delta = test_output1 - ctrl_output1
+        denom = np.where(np.abs(ctrl_output1) > 0, np.abs(ctrl_output1), 1.0)
+        ratio = delta / denom
+        vmin, vmax = np.min(ratio), np.max(ratio)
+        print(f"Ratio range: {vmin:.3e} to {vmax:.3e}")
+
+        import scipy.stats
+        clippy, clow, chigh = scipy.stats.sigmaclip(delta, low=5, high=5)
+
+        vlim = max(np.abs(vmin), np.abs(vmax))
+        #ax[0,2].imshow(tonemap(ratio), origin='lower')#, vmin=vmin, vmax=vmax)
+        ax[0,2].imshow(tonemap(delta), origin='lower')#, vmin=vmin, vmax=vmax)
+        ax[1,2].imshow(delta, origin='lower', vmin=clow, vmax=chigh) # Show the clipped difference for better visibility of the error distribution
+    globals().update(locals()) # For interactive inspection
+
+
+    fig, ax = plt.subplots(2,3, figsize=(10,5))
+
+    # Plot the image differences of control and test
+    #d0 = data0
+    d0 = test_output0
+    ax[0,0].imshow(tonemap(test_output1 - d0), origin='lower')
+    ax[1,0].imshow(test_output1 - d0, origin='lower')
+    ax[0,0].set_title("Test (CUDA) Difference")
+
+    #d1 = data0
+    d1 = ctrl_output0
+    ax[0,1].imshow(tonemap(ctrl_output1 - d1), origin='lower')
+    ax[1,1].imshow(ctrl_output1 - d1, origin='lower')
+    ax[0,1].set_title("Control (Astropy) Difference")
+
+    ax[0,2].imshow(tonemap(test_output1 - ctrl_output1), origin='lower')
+    ax[1,2].imshow(test_output1 - ctrl_output1, origin='lower')
+    ax[0,2].set_title("Test - Control Difference")
+    
+    
+
+    fig.tight_layout()
+    plt.show()
 
     #return result
 
@@ -1797,65 +1851,5 @@ def plot_reference_frame():
 
 if __name__ == "__main__":
     #plot_reference_frame()
-    print(validate_coordinate_transforms(n_samples=2048*2048))
+    validate_hcongrid()
     pass
-
-# ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-#  Auxiliary data visualization
-# ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-
-if False: # Test results from validate_coordinate_transforms.
-    data = [
-    [128**2, 0.000000, 0.000521, 0.000000, 0.000000, 0.014567, 0.004535, 0.001002, 0.025624, 0.000000, 0.033502, 0.012582, ],
-    [256**2, 0.000000, 0.000532, 0.000000, 0.002508, 0.014021, 0.032077, 0.007516, 0.039700, 0.002993, 0.038033, 0.081709, ],
-    [512**2, 0.000000, 0.000998, 0.000000, 0.009032, 0.013586, 0.101996, 0.035118, 0.065252, 0.009498, 0.051590, 0.387970, ],
-    [1024**2, 0.000000, 0.000000, 0.000000, 0.040698, 0.017050, 0.517556, 0.118995, 0.149174, 0.039130, 0.208157, 1.391886, ],
-    [2048**2, 0.000000, 0.000409, 0.000152, 0.207451, 0.022495, 1.847724, 0.463264, 0.294955, 0.210375, 0.428163, 5.987498, ]
-    ]
-    data = np.array(data)
-
-    keys = {
-        0: "                 samples",
-        1: "  wcs_variables_validate",
-        2: "wcs_variables_load_nonan",
-        3: "     wcs_assemble_struct",
-        4: "       sample generation",
-        5: "             astropy pre",
-        6: "   astropy all_pix2world",
-        7: "            astropy post",
-        8: "   custom ICRS from TESS",
-        9: "             custom post",
-    10: "   custom TESS from ICRS",
-    11: "       astropy world2pix",
-    }
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    #for i, key in enumerate(keys[1+5:]):
-    for i in [6,11,8,10]:
-        key = keys[i]
-        ax.plot(data[:, 0], data[:, i], marker='o', label=key)
-    ax.set_xscale('log')
-    ax.set_yscale('log')
-    ax.set_xlabel('Number of Samples')
-    ax.set_ylabel('Time (seconds)')
-    ax.set_title('Timing of WCS Mapping Components')
-    ax.legend()
-    plt.grid(True, which="both", ls="--")
-    plt.show()
-
-
-    # Copy result to keyboard via command due to remote access issues:
-    import keyboard
-
-    # get fig canvas rgba data as bytes
-    img = np.array(fig.canvas.buffer_rgba())
-    # Convert to PIL Image and save to clipboard
-    if True:
-        import pyperclip
-        from PIL import Image
-        import io
-        pil_img = Image.fromarray(img)
-        output = io.BytesIO()
-        pil_img.save(output, format='PNG')
-        data = output.getvalue()
-        pyperclip.copy(data)
