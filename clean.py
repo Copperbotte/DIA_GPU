@@ -46,15 +46,22 @@ caldir = 'N/A' #directory with the calibration images such as bias & flat
 from pathlib import Path
 ROOT = Path('C:/Users/Joe/Desktop/Projects/2026_Spring/DIA/')
 cdedir = ROOT / "DIA" / "routines" / "Python"
-#rawdir = ROOT / "DIA_TEMP" / "raw"
-rawdir = ROOT / "TESS_sector_4"
-clndir = ROOT / "DIA_TEMP" / "clean"
+rawdir = ROOT / "DIA_TEMP" / "raw"
+#rawdir = ROOT / "TESS_sector_4"
+clndir = ROOT / "DIA_TEMP" / "clean2"
+clndir_control = ROOT / "DIA_TEMP" / "clean"
 
 # ensure the output directories exist
 ROOT = Path(ROOT)#.mkdir(parents=True, exist_ok=True)
 cdedir = Path(cdedir)#.mkdir(parents=True, exist_ok=True)
 rawdir = Path(rawdir)#.mkdir(parents=True, exist_ok=True)
 clndir = Path(clndir)#.mkdir(parents=True, exist_ok=True)
+clndir_control = Path(clndir_control)
+
+ROOT.mkdir(parents=True, exist_ok=True)
+cdedir.mkdir(parents=True, exist_ok=True)
+rawdir.mkdir(parents=True, exist_ok=True)
+clndir.mkdir(parents=True, exist_ok=True)
 
 #sample every how many pixels? usually 32x32 is OK but it can be larger or smaller
 pix = 32 # UPDATE HERE FOR BACKGROUND SPACING
@@ -64,32 +71,16 @@ axs = 2048 # UPDATE HERE FOR IMAGE AXIS SIZE
 #get the image list and the number of files which need reduction
 #os.chdir(rawdir) #changes to the raw image direcotory
 files = [f for f in rawdir.glob("*.fits") if isfile(join(rawdir, f))] #gets the relevant files with the proper extension
-
-# Cull files that don't match the specified camera and CCD
-camera, ccd = '1', '4'
-def get_camera_and_ccd(f):
-	# with fits.open(f, memmap=True) as hdul:
-	# 	camera = hdul[1].header['CAMERA']
-	# 	ccd = hdul[1].header['CCD']
-	# Grab these from the filename instead due to perf loss
-	# tess2018297215939-s0004-1-4-0124-s_ffic.fits
-	filename = f.stem  # gets filename without extension
-	parts = filename.split('-')
-	camera = parts[2]
-	ccd = parts[3]
-	return camera, ccd
-
-def filter_file(f):
-	#img_data, img_header = fits.getdata(f, header=True)
-	#img_header = fits.getheader(f)
-	# Get these from the data's header manually
-	camera_val, ccd_val = get_camera_and_ccd(f)
-	return (camera_val == camera) and (ccd_val == ccd)
-files = list(filter(filter_file, files))
-
 files.sort()
 nfiles = len(files)
 #os.chdir(cdedir) #changes back to the code directory
+
+# Cull files that don't match the specified camera and CCD
+camera, ccd = '1', '4'
+def filter_file(f):
+	img_data, img_header = fits.getdata(f, header=True)
+	return (img_header['CAMERA'] == camera) and (img_header['CCD'] == ccd)
+files = list(filter(filter_file, files))
 
 #get the zeroth image for registration
 #read in the image
@@ -115,12 +106,8 @@ if (biassub == 1):
 	bheader = blist[0].header #get the header info
 	bias = blist[0].data #get the image info
 
-global_t0 = time.time()
 #begin cleaning
 for ii in range(0, nfiles):
-	if ii == 1:
-		break #DEBUGDEBUGDEBUGDEBUGDEBUGDEBUGDEBUGDEBUG
-
 	file_stem = files[ii].stem  # gets filename without extension
 
 	#update the name to be appropriate for what was done to the file
@@ -134,10 +121,12 @@ for ii in range(0, nfiles):
 		finnme = f'{file_stem}_sfba.fits'
 
 	outpath = clndir / finnme
+	if not clndir.exists():
+		clndir.mkdir(parents=True, exist_ok=True)
 
 	#only create the files that don't exist
 	#if not outpath.exists():
-	if True:
+	if True: # DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG DEBUG
 		#start the watch
 		st = time.time()
 		sts = time.strftime("%c")
@@ -164,22 +153,29 @@ for ii in range(0, nfiles):
 		if (biassub == 1) and (flatdiv == 1):
 			bigimg = bigimg - bias #subtract the bias
 			bigimg = bigimg/flat #subtract the flat
+		
+		tsc_0 = time.time()
 		tts = 0
 		for oo in range(0, axs, bxs):
 			for ee in range(0, axs, bxs):
 				img = bigimg[ee:ee+bxs, oo:oo+bxs] #split the image into small subsections
-				print(f"{img.dtype = }")
 				
 				#calculate the sky statistics
 				cimg, clow, chigh = scipy.stats.sigmaclip(img, low=2.5, high = 2.5) #do a 2.5 sigma clipping
 				sky = numpy.median(cimg) #determine the sky value
 				sig = numpy.std(cimg) #determine the sigma(sky)
-				print(f"{type(sky) = }, {type(sig) = }")
 
 				bck[tts] = sky #insert the image median background
 				sbk[tts] = sig #insert the image sigma background
-				print(f"{bck[tts].dtype = }, {sbk[tts].dtype = }")
-
+				
+		tsc_1 = time.time()
+		print(f'Sigma Clip for {files[ii]} finished in {tsc_1 - tsc_0}s.')
+		
+		tts = 0
+		for oo in range(0, axs, bxs):
+			for ee in range(0, axs, bxs):
+				img = bigimg[ee:ee+bxs, oo:oo+bxs] #split the image into small subsections
+				
 				#create holder arrays for good and bad pixels
 				x = numpy.zeros(shape=(int(sze),), dtype=float)
 				y = numpy.zeros(shape=(int(sze),), dtype=float)
@@ -266,11 +262,9 @@ for ii in range(0, nfiles):
 				XI, YI = numpy.meshgrid(xi, yi)
 				rbf = Rbf(x, y, v, function = 'thin-plate', smooth = 0.0)
 				reshld = rbf(XI, YI)
-				print(f"{reshld.dtype = }")
 			
 				#now add the values to the residual image
 				res[ee:ee+bxs, oo:oo+bxs] = reshld
-				print(f"{res.dtype = }")
 				tts = tts+1
 
 		#get the median background
@@ -280,13 +274,11 @@ for ii in range(0, nfiles):
 		#subtract the sky gradient and add back the median background
 		sub = bigimg-res
 		sub = sub + mbck
-		print(f"{sub.dtype = }", f"{bigimg.dtype = }", f"{res.dtype = }", f"{mbck.dtype = }")
 
 		#align the image
 		# NOTE: `hcongrid` was originally used for alignment. If available,
 		# uncomment the import at the top and ensure the function is on PATH.
 		algn = hcongrid(sub, header, rhead)
-		print(f"{algn.dtype = }")
 
 		#update the header
 		header['CTYPE1'] = rhead['CTYPE1']
@@ -318,7 +310,22 @@ for ii in range(0, nfiles):
 		#stop the watch
 		fn = time.time()
 		print(f'Background subtraction for {files[ii]} finished in {fn-st}s.')
+		
+		# clndir_control
+		# Find the max abs error between the file we just wrote and the control file.
+		# files = [f for f in rawdir.glob("*.fits") if isfile(join(rawdir, f))]
+		# orgimg, header = fits.getdata(files[ii], header = True)
+		
+		# Load the cleaned image we just wrote
+		cleaned_img, cleaned_header = fits.getdata(outpath, header=True)
+		
+		# Load the control image
+		control_path = clndir_control / finnme
+		control_img, control_header = fits.getdata(control_path, header=True)
+		
+		print(f"Max abs error vs control image: {numpy.max(numpy.abs(cleaned_img - control_img)) = }")
+
+
+
 
 print('All done! See ya later alliagtor.')
-global_t1 = time.time()
-print(f'Total processing time: {global_t1 - global_t0}s')
