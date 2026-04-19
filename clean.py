@@ -2539,6 +2539,840 @@ class CUDAHcongridContainer:
 #         return out
 
 
+
+
+def slog(img):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        result = np.log(img)
+    # Find the value that is the smallest non nan, non inf value in the image
+    mask = np.isfinite(result) 
+    #vmin = result[mask].min() # ValueError: zero-size array to reduction operation minimum which has no identity
+    vmin = result[mask].min() if np.any(mask) else 0
+    result[~mask] = vmin
+    return result
+
+def slog_asinh(img, scale=1.0):
+    return np.arcsinh(img * scale)
+
+# Simple log luminance tonemapper. Taken from visualizer.py.
+def tonemap(img, hstart=0, hend=-1):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        #ld = np.log(img)
+        ld = slog(img)
+        #ld = slog_asinh(img)
+        #ld = img
+    ld_fltr = ld[~np.isnan(ld) & ~np.isinf(ld)]
+    ld_nan = np.nan_to_num(ld, nan=np.nanmax(ld_fltr), neginf=np.nanmin(ld_fltr), posinf=np.nanmax(ld_fltr))
+    histo, bin_edges = np.histogram(ld_nan[hstart:hend], bins=4096)
+    #histo, bin_edges = np.histogram(ld_nan, bins=1024)
+    bins = (bin_edges[:-1] + bin_edges[1:]) / 2
+    cs_histo = np.cumsum(histo)
+    cdf_histo = cs_histo.astype(np.float64) / cs_histo[-1].astype(np.float64)
+    ld_mapped = np.interp(ld_nan, bins, cdf_histo)
+    return ld_mapped
+
+
+
+
+import matplotlib.pyplot as plt
+cmap = plt.get_cmap("viridis")
+
+# views[0].shape = [2048, 2048, 4]
+# list(reversed(views[0].shape))[1:]) -> [4, 2048, 2048][1:] -> [2048, 2048]
+
+def write_cv2(name, views, fps=60):
+    import cv2
+    frames = [cv2.cvtColor(view, cv2.COLOR_RGBA2BGR) for view in views]
+    fourcc = cv2.VideoWriter_fourcc(*'h264')
+    writer = cv2.VideoWriter(name, fourcc, fps, list(reversed(views[0].shape))[1:])
+    for frame in frames:
+        writer.write(frame)
+    writer.release()
+    print("wrote", name)
+
+
+def compress_ffmpeg(name, name2, audiosrc=None):
+    command = 'ffmpeg -i "%s" -c:v libx264 -b:v 5M -preset veryslow -crf 22 -y "%s"'%(name, name2)
+    if type(audiosrc) != type(None):
+        command = 'ffmpeg -i "%s" -i "%s" -c:v libx264 -b:v 5M -preset veryslow -crf 22 -c:a aac -strict experimental -y "%s"'%(name, audiosrc, name2)
+    print(">", command)
+    #command = command.split(' ')
+    #import subprocess as sp
+    #sp.call(command)
+    Call(command)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+#  write_cv2_low_memory & shader
+# ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+cu_code = r"""
+
+
+"""
+
+
+# For later:
+# krnl = cuda_compile(cu_code)
+
+import cv2
+def write_cv2_low_memory():
+
+    global_min = np.inf
+    global_max = -np.inf
+
+    beta1, beta2, eps = 0.9, 0.999, 1e-8*0
+    m = np.zeros((2048, 2048), dtype=np.float64)
+    v = np.zeros((2048, 2048), dtype=np.float64)
+    #''' # Disable chunks
+    t0 = time.time()
+    cv2timing = []
+    for i in range(len(sector_data)):
+        group_median = np.median(sector_data[max(0,i-3):][:4], axis=0)
+        g = sector_data[i] - group_median
+        g = slog(np.abs(g))
+        m[:] = beta1 * m + (1 - beta1) * g
+        if i == 0:
+            m[:] = g
+        t = i+1
+        m_hat = m / (1 - beta1**t)
+        #frame = slog(np.abs(m_hat))
+        frame = m_hat
+        fmin, fmax = frame.min(), frame.max()
+        global_min = min(global_min, fmin)
+        global_max = max(global_max, fmax)
+
+        t1 = time.time()
+        cv2timing.append(t1 - t0)
+        ETA = "[ETA: Calculating...]"
+        if ii >= 2:
+            recent_time = np.array(cv2timing)
+            recent_nums = (np.arange(nfiles)+1)[:len(recent_time)]
+
+            # recent_nums = frame indices, recent_time = wall-clock timestamps
+            eta_coeffs = np.polyfit(recent_nums, recent_time, 1)  # frame → time
+            ETA_seconds = np.polyval(eta_coeffs, nfiles) - cv2timing[-1]
+
+            # ETA seconds
+            ETA = humanize.precisedelta(ETA_seconds, format="%0.3f")
+            ETA = f"[ETA: {ETA}]"
+
+        if i % 10 == 0:
+            print(f"{i}/{len(sector_data)}", ETA)
+
+    # Now accumulate histogram with fixed bin edges
+    n_bins = 4096
+    bin_edges = np.linspace(global_min, global_max, n_bins + 1)
+    bins = (bin_edges[:-1] + bin_edges[1:]) / 2
+    global_histo = np.zeros(n_bins, dtype=np.int64)
+
+    t0 = time.time()
+    cv2timing = []
+    for i in range(len(sector_data)):
+        group_median = np.median(sector_data[max(0,i-3):][:4], axis=0)
+        g = sector_data[i] - group_median
+        g = slog(np.abs(g))
+        m[:] = beta1 * m + (1 - beta1) * g
+        if i == 0:
+            m[:] = g
+        t = i+1
+        m_hat = m / (1 - beta1**t)
+        #frame = slog(np.abs(m_hat))
+        frame = m_hat
+        h, _ = np.histogram(frame, bins=bin_edges)
+        global_histo += h
+
+        t1 = time.time()
+        cv2timing.append(t1 - t0)
+        ETA = "[ETA: Calculating...]"
+        if ii >= 2:
+            recent_time = np.array(cv2timing)
+            recent_nums = (np.arange(nfiles)+1)[:len(recent_time)]
+
+            # recent_nums = frame indices, recent_time = wall-clock timestamps
+            eta_coeffs = np.polyfit(recent_nums, recent_time, 1)  # frame → time
+            ETA_seconds = np.polyval(eta_coeffs, nfiles) - cv2timing[-1]
+
+            # ETA seconds
+            ETA = humanize.precisedelta(ETA_seconds, format="%0.3f")
+            ETA = f"[ETA: {ETA}]"
+
+        if i % 10 == 0:
+            print(f"{i}/{len(sector_data)}", ETA)
+
+    globals().update(locals()) # For interactive inspection
+
+
+    #fig, ax = plt.subplots()
+    #aximg = ax.imshow(cmap(tonemap(sector_data[0])))
+    # ── Build CDF (once) ────────────────────────────────────────────
+    cdf = np.cumsum(global_histo).astype(np.float64)
+    cdf /= cdf[-1]
+    #'''
+    fourcc = cv2.VideoWriter_fourcc(*'h264')
+    writer = cv2.VideoWriter('..\..\..\sector4_the_movie_group_median_2_raw.mp4', fourcc, 60, [2048,2048])
+
+
+
+    t0 = time.time()
+    cv2timing = []
+    for i in range(len(sector_data)):
+        t = i+1
+        group_median = np.median(sector_data[max(0,i-3):][:4], axis=0)
+        g = sector_data[i] - group_median
+        g = slog(np.abs(g))
+        m[:] = beta1 * m + (1 - beta1) * g
+        if i == 0:
+            m[:] = g
+        t = i+1
+        m_hat = m / (1 - beta1**t)
+        #frame = slog(np.abs(m_hat))
+        frame = m_hat
+
+        mapped = np.interp(frame, bins, cdf)  # consistent global tonemap
+        #mapped = np.interp(denoised, bins, cdf)  # consistent global tonemap
+        rgb = (cmap(mapped)*255).astype(np.uint8)
+        globals().update(locals())
+        #aximg.set_data(rgb)
+        #fig.canvas.draw_idle()
+        cv2sucks = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
+        cv2.imshow('tess s4 c1 ccd4',cv2sucks)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+        writer.write(cv2sucks)
+        t1 = time.time()
+        cv2timing.append(t1 - t0)
+
+        ETA = "[ETA: Calculating...]"
+        if ii >= 2:
+            recent_time = np.array(cv2timing)
+            recent_nums = (np.arange(nfiles)+1)[:len(recent_time)]
+
+            # recent_nums = frame indices, recent_time = wall-clock timestamps
+            eta_coeffs = np.polyfit(recent_nums, recent_time, 1)  # frame → time
+            ETA_seconds = np.polyval(eta_coeffs, nfiles) - cv2timing[-1]
+
+            # ETA seconds
+            ETA = humanize.precisedelta(ETA_seconds, format="%0.3f")
+            ETA = f"[ETA: {ETA}]"
+
+        if i % 10 == 0:
+            print(f"{i}/{len(sector_data)}", ETA)
+
+    writer.release()
+    globals().update(locals()) # For interactive inspection
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+r'''
+>>> frames = np.array(frames)
+>>> frames.shape
+(100, 2048, 2048)
+>>> meanimg = np.zeros_like(frames[0])
+>>> metadata = np.array(metadata)
+>>> times, mbcks = metadata.T
+>>> coeffs = np.polyfit(times, mbcks, 1)
+>>> trend = np.polyval(coeffs, times)
+>>> drift = trend - np.median(mbcks)
+>>> median_bg = np.median(frames - drift[:, None, None], axis=0)
+#>>> scary = tonemap(frames - meanimg[None,:,:] - trend[:,None,None])  # scary ram consumption. I'm at ~80% of my 64gb of ram used! (with windows)
+>>> scary = frames - median_bg[None,:,:] - trend[:,None,None]
+>>> scary = tonemap(scary)
+>>> views = [(cmap(img)*255).astype(np.uint8) for img in scary]
+>>> write_cv2(r'../../../tess_sector4_cam1_ccd1_100frames_flat_nomean_raw3.mp4', views, fps=15)
+wrote ../../../tess_sector4_cam1_ccd1_100frames_flat_nomean_raw3.mp4
+
+# I've got it **all** in ram at the moment. We've gotta be careful with how we process with cv2 for now. I dont have much ram left.
+import Optical_Tools_2025 as ot
+import cv2
+fourcc = cv2.VideoWriter_fourcc(*'h264')
+writer = cv2.VideoWriter('..\..\..\sector4_the_movie_delta_01.mp4', fourcc, 60, [2048,2048])
+
+# Lets stream each frame as a tonemapped, cmap like the views above. 
+times = np.array([header["TSTART"] for header in sector_headers])
+mbcks = np.array([header["MEDBACK"] for header in sector_headers])
+
+# ── Pass 1: Build global histogram from ALL frames ──────────────
+# First need global min/max of arcsinh(residuals)
+global_min = np.inf
+global_max = -np.inf
+for i in range(len(sector_data)):
+    frame = np.arcsinh(sector_data[i] - sector_median)
+    fmin, fmax = frame.min(), frame.max()
+    global_min = min(global_min, fmin)
+    global_max = max(global_max, fmax)
+    if i % 100 == 0: print(i)
+
+# Now accumulate histogram with fixed bin edges
+n_bins = 4096
+bin_edges = np.linspace(global_min, global_max, n_bins + 1)
+bins = (bin_edges[:-1] + bin_edges[1:]) / 2
+global_histo = np.zeros(n_bins, dtype=np.int64)
+
+for i in range(len(sector_data)):
+    frame = np.arcsinh(sector_data[i] - sector_median)
+    h, _ = np.histogram(frame, bins=bin_edges)
+    global_histo += h
+    if i % 100 == 0: print(i)
+
+# ── Build CDF (once) ────────────────────────────────────────────
+cdf = np.cumsum(global_histo).astype(np.float64)
+cdf /= cdf[-1]
+
+t0 = time.time()
+cv2timing = []
+for i in range(len(sector_data)):
+    frame = np.arcsinh(sector_data[i] - sector_median)
+    mapped = np.interp(frame, bins, cdf)  # consistent global tonemap
+    rgb = (cmap(mapped)*255).astype(np.uint8)
+    writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR))
+    t1 = time.time()
+    cv2timing.append(t1 - t0)
+
+    ETA = "[ETA: Calculating...]"
+    if ii >= 2:
+        recent_time = np.array(cv2timing)
+        recent_nums = (np.arange(nfiles)+1)[:len(recent_time)]
+
+        # recent_nums = frame indices, recent_time = wall-clock timestamps
+        eta_coeffs = np.polyfit(recent_nums, recent_time, 1)  # frame → time
+        ETA_seconds = np.polyval(eta_coeffs, nfiles) - t1
+
+        ETA = humanize.precisedelta(ETA_seconds, format="%0.3f")
+        ETA = f"[ETA: {ETA}]"
+    
+    if i % 100 == 0:
+        print(f"{i}/{len(sector_data)}", ETA)
+
+writer.release()
+
+
+#LUT = np.array(cmap.colors).astype(np.float64)
+## LUT is guaranteed to be 256x3, with values in [0,1]. 
+
+write_cv2(r'../../../tess_sector4_cam1_ccd1_100frames_flat_median_detrend_raw1.mp4', views, fps=15)
+compress_ffmpeg(r'../../../tess_sector4_cam1_ccd1_100frames_flat_median_detrend_raw1.mp4', r'../../../tess_sector4_cam1_ccd1_100frames_flat_median_detrend_1.mp4')
+
+
+
+# Lets denoise this image signal via a psuedospectral NUFT approach. I'm sure the astronomers would
+# love seeing LS used in this way.
+# times, mbcks = metadata.T
+# "Well, the interesting thought here is to try a psuedospectral transform. Only fft per pixel in time, leave space alone. That way a signal now follows the local linear trajectory of [ω, x, y]*t, rather than [ω, kx, ky]*t, which would be a wave. We sigma clip away these good signals and what's left is the noise! I suppose it is a bit wavelet-like."
+# So in this instance, we use times to build a NUFT *per pixel* of the "scary" image,
+#     then use a sigma mask over the power spectra in [ω, x, y] space to isolate the noisy cells. 
+#     Finally, we apply that mask, and perform an iNUFT.
+# We need to be careful about file sizes. 'scary' is 3.12GB on disk. This is workable in ram, but we need to
+# keep an eye on what we're doing.
+# I'll sketch in this file, execute in the shell, and report back.
+
+dt = (times[-1] - times[0])/len(times)
+
+w = np.fft.fftfreq(times.size, dt) # shape (ω,)
+phasor = np.exp(np.pi*2j * times[None,:] * w[:,None]) # shape (t, ω)
+
+# Now the part we need to be very careful of to prevent this 3gb -> 300gb.
+# psuedospectral = scary @ phasor # shape (x, y, ω) = (2048, 2048, 100) -> 600gb intermediate!
+psuedospectral = np.zeros_like(scary, dtype=np.complex128) # shape (ω, x, y) = (100, 2048, 2048) -> 6gb.
+#for i in range(scary.shape[0]):
+#    psuedospectral += scary[i] * phasor[i][:,None,None]
+for y in range(scary.shape[1]):
+    psuedospectral[:, y, :] = phasor @ scary[:,y,:]
+    if y%128 == 0:
+        print(y)
+
+>>> plt.imshow(np.abs(psuedospectral[0])**2)
+<matplotlib.image.AxesImage object at 0x000001D1F0608F80>
+>>> plt.show()
+>>> plt.imshow(np.abs(psuedospectral[1])**2)
+<matplotlib.image.AxesImage object at 0x000001D1F074C0E0>
+>>> plt.show()
+>>> plt.imshow(np.abs(psuedospectral[25])**2)
+<matplotlib.image.AxesImage object at 0x000001D1F0670290>
+>>> plt.show()
+
+import matplotlib.colors as mcolors
+def complex_colormap(z, vmax=None):
+    """Map complex array to RGBA: phase → hue, magnitude → luminance."""
+    mag = np.abs(z)
+    phase = np.angle(z)  # [-π, π]
+    if vmax is None:
+        vmax = np.percentile(mag, 99.5)
+    mag = np.clip(mag / vmax, 0, 1)
+    # Phase → hue (0 to 1), mag → value
+    hue = (phase + np.pi) / (2 * np.pi)  # [0, 1]
+    sat = np.ones_like(mag)
+    hsv = np.stack([hue, sat, mag], axis=-1)
+    return mcolors.hsv_to_rgb(hsv)
+
+
+# mag, phase are both ~4gb. We need to be careful with memory here.
+def complex_to_oklch_rgb(mag, phase, chroma=0.5):
+    """Map complex array → perceptually uniform RGB via OKLab LCH.
+    
+    phase → hue (perceptually uniform rotation)
+    |F|   → lightness (perceptually uniform brightness)
+    """
+    #mag = np.abs(F_slice)
+    #phase = np.angle(F_slice)  # [-π, π]
+    
+    #if mag_vmax is None:
+    #    mag_vmax = np.percentile(mag, 99.5)
+    mag_vmax = 1.0
+
+    clr = np.zeros((100, 2048, 2048, 3), dtype=np.float64) # Hardcode this due to ram restriction.
+    
+    # L in [0, 1], C fixed, H from phase
+    # L = np.clip(mag / mag_vmax, 0, 1)
+    # C = np.full_like(L, chroma)    # constant saturation
+    # H = phase                       # already in radians, oklab_from_oklch expects this
+    clr[..., 0] = np.clip(mag / mag_vmax, 0, 1) # L
+    clr[..., 1] = chroma # C
+    clr[..., 2] = phase # H
+    print("built oklch array")
+    
+    # lab <- lch
+    clr[:] = ot.oklab_from_oklch(clr)                   # (..., 3) OKLab
+    print("converted to oklab")
+
+    # xyz <- lab
+    clr[:] = ot.XYZ_from_oklab(clr)                     # (..., 3) CIE XYZ
+    print("converted to xyz")
+
+    # rgb <- xyz
+    clr[:] = ot.RGB_from_XYZ(clr)                       # (..., 3) linear RGB
+    print("converted to linear rgb")
+
+    # srgb <- rgb
+    clr[:] = ot.sRGB_from_RGB(np.clip(clr, 0, 1))     # (..., 3) sRGB gamma
+    print("converted to sRGB")
+    return np.clip(clr, 0, 1)
+
+def nightmare(complex, chroma=0.5):
+    """Map complex array → perceptually uniform RGB via OKLab LCH.
+    
+    phase → hue (perceptually uniform rotation)
+    |F|   → lightness (perceptually uniform brightness)
+    """
+    mag = tonemap(np.abs(complex))
+    phase = np.angle(complex)  # [-π, π]
+    
+    #if mag_vmax is None:
+    #    mag_vmax = np.percentile(mag, 99.5)
+    #mag_vmax = 1.0
+
+    clr = np.zeros((100, 2048, 2048, 3), dtype=np.float64) # Hardcode this due to ram restriction.
+    
+    # L in [0, 1], C fixed, H from phase
+    # L = np.clip(mag / mag_vmax, 0, 1)
+    # C = np.full_like(L, chroma)    # constant saturation
+    # H = phase                       # already in radians, oklab_from_oklch expects this
+    clr[..., 0] = mag#np.clip(mag, 0, 1) # L
+    clr[..., 1] = chroma # C
+    clr[..., 2] = phase # H
+    del mag, phase # Free up memory
+    print("built oklch array")
+    
+    # lab <- lch
+    clr[:] = ot.oklab_from_oklch(clr)                   # (..., 3) OKLab
+    print("converted to oklab")
+
+    # xyz <- lab
+    clr[:] = ot.XYZ_from_oklab(clr)                     # (..., 3) CIE XYZ
+    print("converted to xyz")
+
+    # rgb <- xyz
+    clr[:] = ot.RGB_from_XYZ(clr)                       # (..., 3) linear RGB
+    print("converted to linear rgb")
+
+    # srgb <- rgb
+    clr[:] = ot.sRGB_from_RGB(np.clip(clr, 0, 1))     # (..., 3) sRGB gamma
+    print("converted to sRGB")
+    return np.clip(clr, 0, 1)
+
+def nightmare(cplx, chroma=0.5):
+    """Map complex array → perceptually uniform RGB via OKLab LCH.
+    
+    phase → hue (perceptually uniform rotation)
+    |F|   → lightness (perceptually uniform brightness)
+    """
+    mag = tonemap(np.abs(cplx))
+    phase = np.angle(cplx)  # [-π, π]
+    
+    #if mag_vmax is None:
+    #    mag_vmax = np.percentile(mag, 99.5)
+    #mag_vmax = 1.0
+
+    #clr = np.zeros((100, 2048, 2048, 3), dtype=np.float64) # Hardcode this due to ram restriction.
+    clr = np.zeros((*cplx.shape, 3), dtype=np.float64)
+    
+    # L in [0, 1], C fixed, H from phase
+    # L = np.clip(mag / mag_vmax, 0, 1)
+    # C = np.full_like(L, chroma)    # constant saturation
+    # H = phase                       # already in radians, oklab_from_oklch expects this
+    clr[..., 0] = mag#np.clip(mag, 0, 1) # L
+    clr[..., 1] = chroma # C
+    clr[..., 2] = phase # H
+    #del mag, phase # Free up memory
+    #print("built oklch array")
+    
+    # lab <- lch
+    clr[:] = ot.oklab_from_oklch(clr)                   # (..., 3) OKLab
+    #print("converted to oklab")
+
+    # xyz <- lab
+    clr[:] = ot.XYZ_from_oklab(clr)                     # (..., 3) CIE XYZ
+    #print("converted to xyz")
+
+    # rgb <- xyz
+    clr[:] = ot.RGB_from_XYZ(clr)                       # (..., 3) linear RGB
+    #print("converted to linear rgb")
+
+    # srgb <- rgb
+    clr[:] = ot.sRGB_from_RGB(np.clip(clr, 0, 1))     # (..., 3) sRGB gamma
+    #print("converted to sRGB")
+    return np.clip(clr, 0, 1)
+
+scary = frames - median_bg[None,:,:] - trend[:,None,None]
+psuedospectral = np.zeros_like(scary, dtype=np.complex128) # shape (ω, x, y) = (100, 2048, 2048) -> 6gb.
+for y in range(scary.shape[1]):
+    psuedospectral[:, y, :] = phasor @ scary[:,y,:]
+    if y%128 == 0:
+        print(y)
+clr = nightmare(psuedospectral, chroma=0.5)
+#'''
+
+import Optical_Tools_2025 as ot
+def nightmare(cplx, chroma=0.5):
+    """Map complex array → perceptually uniform RGB via OKLab LCH.
+    
+    phase → hue (perceptually uniform rotation)
+    |F|   → lightness (perceptually uniform brightness)
+    """
+    mag = tonemap(np.abs(cplx))
+    phase = np.angle(cplx)  # [-π, π]
+    
+    #if mag_vmax is None:
+    #    mag_vmax = np.percentile(mag, 99.5)
+    #mag_vmax = 1.0
+
+    #clr = np.zeros((100, 2048, 2048, 3), dtype=np.float64) # Hardcode this due to ram restriction.
+    clr = np.zeros((*cplx.shape, 3), dtype=np.float64)
+    
+    # L in [0, 1], C fixed, H from phase
+    # L = np.clip(mag / mag_vmax, 0, 1)
+    # C = np.full_like(L, chroma)    # constant saturation
+    # H = phase                       # already in radians, oklab_from_oklch expects this
+    clr[..., 0] = mag#np.clip(mag, 0, 1) # L
+    clr[..., 1] = chroma # C
+    clr[..., 2] = phase # H
+    #del mag, phase # Free up memory
+    #print("built oklch array")
+    
+    # lab <- lch
+    clr[:] = ot.oklab_from_oklch(clr)                   # (..., 3) OKLab
+    #print("converted to oklab")
+
+    # xyz <- lab
+    clr[:] = ot.XYZ_from_oklab(clr)                     # (..., 3) CIE XYZ
+    #print("converted to xyz")
+
+    # rgb <- xyz
+    clr[:] = ot.RGB_from_XYZ(clr)                       # (..., 3) linear RGB
+    #print("converted to linear rgb")
+
+    # srgb <- rgb
+    clr[:] = ot.sRGB_from_RGB(np.clip(clr, 0, 1))     # (..., 3) sRGB gamma
+    #print("converted to sRGB")
+    return np.clip(clr, 0, 1)
+
+@numba.njit(parallel=True)
+def mini_batch_median(sector_data, batch, ii):
+    if ii >= 4: # Update the sector with the new batch
+        sector_data[ii-4] -= batch[0]
+    batch[:-1] = batch[1:] # Shift back the batches
+    #batch[-1] = np.median(sector_data[max(0,ii-3):min(ii+4, len(sector_data))], axis=0)
+
+    for i in numba.prange(sector_data.shape[1]):
+        for j in numba.prange(sector_data.shape[2]):
+            #batch[-1, i, j] = np.median(sector_data[max(0,ii-3):min(ii+4, len(sector_data)), i, j])
+            # Given a vector ``V`` of length ``N``, the median of ``V`` is the
+            # middle value of a sorted copy of ``V``, ``V_sorted`` - i
+            # e., ``V_sorted[(N-1)/2]``, when ``N`` is odd, and the average of the
+            # two middle values of ``V_sorted`` when ``N`` is even.
+            # In this case, I have exactly 8 elements in the batch (ii-4:ii+3 inclusive), so the median is the average of the 4th and 5th elements in the sorted batch.
+            # Since this is numba, I dont think I can do a full sort. But since its just 8 elemenents, perhaps I can get away with something O(n^2).
+            strand = sector_data[max(0,ii-3):min(ii+4, len(sector_data)), i, j]
+            for a in range(strand.size):
+                for b in range(a+1, strand.size):
+                    if strand[b] < strand[a]:
+                        strand[a], strand[b] = strand[b], strand[a]
+            batch[-1, i, j] = 0.5 * (strand[3] + strand[4]) # Average of the two middle values for even-length batch
+
+
+
+
+def kill_ram_chunk():
+
+    # Load one file
+    #"""
+    files = get_file_list(camera=1, ccd=4) # Filter for camera 1, CCD 4
+    data, header = fits.getdata(files[0], header=True)
+    data = data.astype(np.float64)
+    print(f"{data.shape = }, {data.dtype = }")
+
+    # malloc 30gb lol
+    sector_data = np.empty((len(files), 512,512), dtype=np.float64)
+    sector_headers = []
+
+    # add this one in
+    #sector_data[0] = data  # First frame loaded, rest is uninitialized
+    globals().update(locals())
+
+    # draw the rest of the fucking owl
+    t0 = time.time()
+    for ii, (data, header) in enumerate(make_file_generator(files)):
+        sector_data[ii] = data[:512,:512] - np.median(data[:512,:512], axis=0)[None,:]
+        sector_headers.append(header)
+        #offset_sector_data(sector_data, ii, data)
+        cv2_imshow(tonemap(sector_data[ii]), title=f'tess s4 c1 ccd4 f{ii}')
+    print('aah done')
+    globals().update(locals())
+    #"""
+
+    batch = np.zeros((4, *sector_data.shape[1:]), dtype=np.float64)
+    for ii in range(len(sector_data)):
+        # Write to sector_data when we no longer need the original data, to save RAM. This is a rolling buffer of the last 4 frames, which we use to compute the median for the current frame.
+        if ii >= 4:
+            sector_data[ii-4] -= batch[0]
+        batch[:-1] = batch[1:]
+        batch[-1] = np.median(sector_data[max(0,ii-3):min(ii+4, len(sector_data))], axis=0)
+        #mini_batch_median(sector_data, batch, ii)
+        cv2_imshow(tonemap(sector_data[ii]), title=f'tess s4 c1 ccd4 f{ii}')
+    print('almost')
+    # Fill in the last frames left in the batch
+    for i in range(4):
+        sector_data[-i] -= batch[i]
+
+    t1 = time.time()
+    print(f"Loaded {len(files)} files in {humanize.precisedelta(t1 - t0)}.")
+    globals().update(locals())
+
+@numba.njit(parallel=True)
+def prepcv2(img, LUT):
+    lo = np.min(img)
+    hi = np.max(img)
+    colorbuffer = np.empty((*img.shape, len(LUT[0])), dtype=np.uint8)
+    for ii in numba.prange(img.shape[0]):
+        for jj in numba.prange(img.shape[1]):
+            val = img[ii,jj]
+            if np.isnan(val):
+                val = lo
+            if np.isneginf(val):
+                val = lo
+            idx = int(255.0*((val - lo) / (hi - lo)))
+            colorbuffer[ii,jj] = (LUT[idx][::-1]*255.0).astype(np.uint8)
+    return colorbuffer
+
+import cv2
+LUT = np.array(cmap.colors).astype(np.float64)
+def cv2_imshow(img, title='tess', prep=True):
+    if prep:
+        img = prepcv2(img, LUT)
+    cv2.imshow('tess', img)
+    cv2.setWindowTitle('tess', title)
+    cv2.waitKey(1)
+
+
+
+
+#raise Exception("This is a warning that the code below is for testing and may consume a lot of RAM. Proceed with caution.")
+
+
+# cv2 animation loop
+
+framenum = 0
+while cv2.waitKey(1) & 0xFF != ord("q"):
+    cv2_imshow(tonemap(sector_data[framenum]), title=f'tess s4 c1 ccd4 f{framenum}')
+    framenum += 1
+    framenum = framenum % len(sector_data)
+
+def animate_cv2(seq, cplx=False, ema=False, ema_alpha=0.1, fltr=None):
+    framenum = 0
+    ema = seq[0].copy()
+    if cplx:
+        fltr = nightmare
+    if fltr is None:
+        fltr = lambda x: x
+    while cv2.waitKey(1) & 0xFF != ord("q"):
+        framenum = framenum % len(seq) # Handles negatives gracefully
+        if ema:
+            ema[:] = ema*(1-ema_alpha) + ema_alpha*seq[framenum]
+        else:
+            ema[:] = seq[framenum]
+
+        cv2_imshow(fltr(ema), title=f'tess s4 c1 ccd4 f{framenum}')
+        framenum += 1
+
+def spectral_denoise(sector_data, sector_headers):
+
+    times = np.array([header["TSTART"] for header in sector_headers])
+    N = len(times)
+    dt = 0.0165
+    frame_times = times[0] + dt*np.arange(1570)
+    w = np.fft.fftfreq(1570, dt)
+    ph = np.exp(2j * np.pi * w[:,None] * times[None,:])
+    F = (ph @ sector_data.reshape(1042, -1)).reshape((-1,512,512))
+    print("F done")
+    Q = np.sum(ph**2, axis=1)
+    den = N * N - np.abs(Q) ** 2
+    P_ls = 2.0 * (N * np.abs(F) ** 2 - np.real(Q[:,None,None] * np.conj(F) ** 2)) / den[:,None,None]
+    print("P_ls done")
+    alpha = 2.0 * (N * F - Q[:,None,None] * np.conj(F)) / den[:,None,None]
+    print("alpha done")
+
+    phasor = np.exp(-2j * np.pi * w[:,None] * frame_times[None,:])
+    #phasor0 = np.exp(-2j * np.pi * w * frame_times[0])
+    phasor0 = phasor[:,0]
+    
+    #recon_alpha = (phasor @ alpha.reshape((len(alpha), -1))).reshape((-1, 512,512))
+    recon_alpha = np.fft.fft(alpha * phasor0*[:,None,None], axis=0).real
+    print("recon alpha done")
+    #recon_nuft = (F @ alpha.reshape((len(alpha), -1))).reshape((-1, 512,512))
+    recon_nuft = np.fft.fft(F * phasor0[:,None,None], axis=0).real
+    print("recon nuft done")
+
+    
+    
+
+    # Resample image to undistort
+    w_tan = WCS(naxis=2)
+    w_tan.wcs.crpix = w_sip.wcs.crpix.copy()
+    w_tan.wcs.crval = w_sip.wcs.crval.copy()
+    w_tan.wcs.cd    = w_sip.wcs.cd.copy()
+    w_tan.wcs.ctype = ['RA---TAN', 'DEC--TAN']  # no SIP!
+    yy, xx = np.mgrid[0:512, 0:512].astype(np.float64)
+
+    px_out = np.column_stack([xx.ravel(), yy.ravel()])
+    sky = w_tan.all_pix2world(px_out, 0)        # ideal grid → (RA, Dec)
+    px_src = w_sip.all_world2pix(sky, 0)         # (RA, Dec) → where to sample in distorted frame
+    map_x = px_src[:, 0].reshape(512, 512)       # source x per output pixel
+    map_y = px_src[:, 1].reshape(512, 512)       # source y per output pixel
+
+    cx, cy = 256, 256  # center of your 512×512 chunk
+    shift_x = map_x[cy, cx] - cx
+    shift_y = map_y[cy, cx] - cy
+    map_x -= shift_x
+    map_y -= shift_y
+    
+    n_frames = recon_nuft.shape[0]
+    undistorted = np.empty((n_frames, 512, 512), dtype=np.float64)
+    for i in range(n_frames):
+        undistorted[i] = map_coordinates(
+            recon_nuft[i],   # full frame (or at least enough to cover the map)
+            [map_y, map_x],    # scipy convention: [row, col] = [y, x]
+            order=3, mode='constant', cval=0.0
+        )
+    globals().update(locals())
+
+"""
+# Lets crop the spectra and fft back to see what happens.
+yy, xx = np.indices(F_xy.shape[1:])
+# Adjust so the zero index is in the center
+yy = yy - F_xy.shape[1]//2
+xx = xx - F_xy.shape[2]//2
+rr = np.sqrt(xx**2 + yy**2)
+mask = rr < 50 # Keep only low frequencies within a radius of 50 pixels
+mask = np.fft.ifftshift(mask) # Shift back the mask so it aligns with the unshifted FFT
+F_xy_masked = F_xy * mask[None,:,:]
+
+while cv2.waitKey(1) & 0xFF != ord("q"):
+    #ema[:] = ema*0.9 + 0.1*rcn[framenum]
+    cv2_imshow(tonemap(np.fft.fftshift(np.abs(F_xy[framenum]))), title=f'tess s4 c1 ccd4 f{framenum}')
+    framenum += 1
+    if framenum >= len(rcn):
+        framenum -= len(rcn)
+"""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Lets find a way to have python report what in its ram is consuming all my memory. I need to manually clean it.
+# def report_ram():
+#     import psutil
+#     process = psutil.Process()
+#     mem_info = process.memory_info()
+#     print(f"RAM usage: {mem_info.rss / (1024**3):.2f} GB")
+# Oh, I mean per global scope variable.
+def report_ram_for_all_symbols():
+    import psutil
+    import sys
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    print(f"Total RAM usage: {mem_info.rss / (1024**3):.2f} GB")
+    print("RAM usage by global variables:")
+    items = sorted(globals().items(), key=lambda item: sys.getsizeof(item[1]), reverse=True)
+    # Cull items with "0.0MB"
+    items = [(name, obj) for name, obj in items if sys.getsizeof(obj) > 0]
+
+    for name, obj in items[:25]:
+        size_mb = sys.getsizeof(obj) / (1024**2)
+        print(f"  {name}: {size_mb:.2f} MB")
+    total_size = sum([sys.getsizeof(obj) / (1024**2) for name, obj in items if sys.getsizeof(obj) > 0])
+    print(f"{total_size = }")
+
+
+
 # Constant memory rbf fitter. This avoids the constant recomputation 
 #     of the same kernel parameters for every chunk in every image.
 class Rbf_parameter_fitter:
